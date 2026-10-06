@@ -18,6 +18,8 @@ const SLOW_FACTOR: f32 = 0.1;
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Selection {
     Window,
+    // シーンの照明 (太陽光と環境光)
+    Light,
     Object(u64),
     // ワールドの中のノード (Blender のオブジェクト名)
     WorldNode(String),
@@ -102,6 +104,8 @@ pub struct EditState {
     pub save_as: Option<SaveAsDialog>,
     // 削除の確認ダイアログを出しているオブジェクト
     pub confirm_delete: Option<u64>,
+    // 削除の確認ダイアログを出しているシーンの名前
+    pub confirm_delete_scene: Option<String>,
     saved_layout: SceneLayout,
     saved_config: AppConfig,
     history: History,
@@ -116,6 +120,7 @@ impl FromWorld for EditState {
             confirm_discard: None,
             save_as: None,
             confirm_delete: None,
+            confirm_delete_scene: None,
             saved_layout: world.resource::<SceneLayout>().clone(),
             saved_config: world.resource::<AppConfig>().clone(),
             history: History::default(),
@@ -131,7 +136,10 @@ impl EditState {
 
     // ダイアログが出ているか (出ている間は 3D 側のキー操作を止める)
     pub fn dialog_open(&self) -> bool {
-        self.confirm_discard.is_some() || self.save_as.is_some() || self.confirm_delete.is_some()
+        self.confirm_discard.is_some()
+            || self.save_as.is_some()
+            || self.confirm_delete.is_some()
+            || self.confirm_delete_scene.is_some()
     }
 
     // 今のシーンと config.ini を上書き保存する。名前が無いシーンは保存できない
@@ -399,6 +407,13 @@ fn keyboard_edit(
 
     match selection {
         Selection::Window => apply(&mut layout.window, false),
+        // ライトは R/F で傾き、Q/E で方角、+/- で明るさを変える
+        Selection::Light => {
+            let light = &mut layout.light;
+            light.pitch_deg += turn_x * ROTATE_SPEED * dt;
+            light.yaw_deg += turn_y * ROTATE_SPEED * dt;
+            light.illuminance = (light.illuminance * SCALE_SPEED.powf(grow * dt)).max(0.0);
+        }
         Selection::Object(id) => {
             if let Some(object) = layout.object_mut(*id) {
                 apply(&mut object.placement, true);
@@ -433,6 +448,7 @@ fn track_history(
 fn draw_selection(
     mut gizmos: Gizmos,
     state: Res<EditState>,
+    layout: Res<SceneLayout>,
     world: Res<WorldInfo>,
     globals: Query<&GlobalTransform>,
     placeables: Query<(Entity, &Placeable)>,
@@ -447,6 +463,11 @@ fn draw_selection(
     match &state.selection {
         // のぞき窓の縁取りは preview.rs (枠・視線・目の位置をまとめて縁取る)
         Some(Selection::Window) => {}
+        // 光の向きを矢印で出す (のぞき窓の少し上から、光が進む向きへ)
+        Some(Selection::Light) => {
+            let start = layout.window.position + Vec3::Y * 0.25;
+            gizmos.arrow(start, start + layout.light.direction() * 0.25, color);
+        }
         Some(Selection::Object(id)) => {
             if let Some((entity, _)) = placeables.iter().find(|(_, p)| p.0 == *id) {
                 origin(&mut gizmos, entity);

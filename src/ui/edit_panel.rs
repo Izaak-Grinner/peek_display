@@ -43,7 +43,7 @@ const HELP_ROWS: [(&str, &str); 19] = [
     ("R / F", "X軸まわりに回転"),
     ("Q / E", "Y軸まわりに回転"),
     ("Z / X", "Z軸まわりに回転"),
-    ("+ / -", "拡大・縮小"),
+    ("+ / -", "拡大・縮小 (ライトは明るさ)"),
     ("Shift を押しながら", "ゆっくり動かす(速さ1/10)"),
     ("Ctrl+Z / Ctrl+Shift+Z", "元に戻す / やり直し (Ctrl+Y でもやり直し)"),
     ("Ctrl+D", "選択中のオブジェクトを複製"),
@@ -87,6 +87,12 @@ enum Action {
     ResetWorldNode(String),
     // のぞき窓を Blender の peek_window の位置に戻す
     ResetWindow,
+    // ライトを初期値に戻す
+    ResetLight,
+    // 保存してあるシーンの削除 (確認ダイアログを出す → 削除する / やめる)
+    AskDeleteScene(String),
+    DeleteScene(String),
+    CancelDeleteScene,
     Duplicate(u64),
     AskDelete(u64),
     Delete(u64),
@@ -175,6 +181,8 @@ pub fn edit_panel(
 
         if let Some(id) = state.confirm_delete {
             delete_dialog(ctx, layout, id, &mut action);
+        } else if let Some(name) = &state.confirm_delete_scene {
+            delete_scene_dialog(ctx, name, library.current.as_deref() == Some(name.as_str()), &mut action);
         } else if let Some(dialog) = &mut state.save_as {
             save_as_dialog(ctx, dialog, library.current.as_deref(), &mut action);
         } else if let Some(pending) = &state.confirm_discard {
@@ -192,6 +200,12 @@ pub fn edit_panel(
                     action = Some(Action::CancelDelete);
                 } else if enter {
                     action = Some(Action::Delete(id));
+                }
+            } else if let Some(name) = &state.confirm_delete_scene {
+                if esc {
+                    action = Some(Action::CancelDeleteScene);
+                } else if enter {
+                    action = Some(Action::DeleteScene(name.clone()));
                 }
             } else if state.save_as.is_some() {
                 if esc {
@@ -278,6 +292,10 @@ pub fn edit_panel(
                 files.layout.world_override_mut(&name).placement = None;
                 files.layout.prune_world_overrides();
             }
+            Some(Action::ResetLight) => files.layout.light = Default::default(),
+            Some(Action::AskDeleteScene(name)) => files.state.confirm_delete_scene = Some(name),
+            Some(Action::DeleteScene(name)) => files.delete_scene(&name),
+            Some(Action::CancelDeleteScene) => files.state.confirm_delete_scene = None,
             Some(Action::ResetWindow) => {
                 if let Some(window) = world.window.clone() {
                     files.layout.window = window;
@@ -367,6 +385,24 @@ impl FileContext<'_> {
                 self.state.import_error = None;
                 self.import.start(ImportKind::World);
             }
+        }
+    }
+
+    // 保存してあるシーンを削除する。今開いているシーンなら、ほかのシーンを開く (無ければ新規)
+    fn delete_scene(&mut self, name: &str) {
+        self.state.confirm_delete_scene = None;
+        let was_current = self.library.current.as_deref() == Some(name);
+        if let Err(e) = self.library.delete(name) {
+            warn!("{}", e);
+            self.state.save_status = Some(SaveStatus::Failed(e));
+            return;
+        }
+        if !was_current {
+            return;
+        }
+        match library::list().first() {
+            Some(next) => self.run(Pending::Open(next.clone())),
+            None => self.run(Pending::New),
         }
     }
 
@@ -468,6 +504,20 @@ fn menu_bar(
                     set(Action::OpenScenesFolder);
                 }
             });
+            ui.menu_button("シーンを削除", |ui| {
+                ui.set_min_width(200.0);
+                let names = library::list();
+                if names.is_empty() {
+                    ui.label(RichText::new("保存したシーンはありません").color(TEXT_HINT));
+                }
+                for name in names {
+                    let is_current = library.current.as_deref() == Some(name.as_str());
+                    let label = if is_current { format!("{} (開いているシーン)…", name) } else { format!("{}…", name) };
+                    if ui.button(label).clicked() {
+                        set(Action::AskDeleteScene(name));
+                    }
+                }
+            });
             ui.separator();
             if ui.button("保存").clicked() {
                 set(Action::Save);
@@ -506,33 +556,6 @@ fn menu_bar(
             }
             if ui.add_enabled(state.can_redo(), egui::Button::new("やり直し")).clicked() {
                 set(Action::Redo);
-            }
-            ui.separator();
-            let selected = match state.selection {
-                Some(Selection::Object(id)) if layout.object(id).is_some() => Some(id),
-                _ => None,
-            };
-            if ui.add_enabled(selected.is_some(), egui::Button::new("複製")).clicked() {
-                if let Some(id) = selected {
-                    set(Action::Duplicate(id));
-                }
-            }
-            if ui.add_enabled(selected.is_some(), egui::Button::new("削除…")).clicked() {
-                if let Some(id) = selected {
-                    set(Action::AskDelete(id));
-                }
-            }
-            // ワールドのノードは消さずに隠す
-            if let Some(Selection::WorldNode(name)) = &state.selection {
-                ui.separator();
-                let label = if world::node_hidden(layout, name) { "表示する" } else { "非表示にする" };
-                if ui.button(label).clicked() {
-                    set(Action::ToggleHidden(name.clone()));
-                }
-                let changed = layout.world_override(name).is_some_and(|o| o.placement.is_some());
-                if ui.add_enabled(changed, egui::Button::new("Blender の値に戻す")).clicked() {
-                    set(Action::ResetWorldNode(name.clone()));
-                }
             }
         });
 
@@ -729,7 +752,7 @@ fn scene_section(
     world: &WorldInfo,
     action: &mut Option<Action>,
 ) {
-    let count = (layout.objects.len() + world.nodes.len() + 1).to_string();
+    let count = (layout.objects.len() + world.nodes.len() + 2).to_string();
     widgets::section_header(ui, "シーン", Some(count), |_| {});
     package_status(ui, package);
 
@@ -812,6 +835,12 @@ fn scene_list(
     let selected = state.selection == Some(Selection::Window);
     if widgets::list_row(ui, selected, Icon::Monitor, ICON_WINDOW, "のぞき窓", "カメラ").clicked() {
         state.selection = Some(Selection::Window);
+    }
+
+    widgets::group_label(ui, "照明", 8.0);
+    let selected = state.selection == Some(Selection::Light);
+    if widgets::list_row(ui, selected, Icon::Sun, ICON_LIGHT, "ライト", "太陽光・環境光").clicked() {
+        state.selection = Some(Selection::Light);
     }
 
     if let Some(path) = &layout.world {
@@ -902,6 +931,7 @@ fn properties(
         ui.spacing_mut().item_spacing.y = 10.0;
         match state.selection.clone() {
             Some(Selection::Window) => window_properties(ui, layout, config, world, panel, action),
+            Some(Selection::Light) => light_properties(ui, layout, world, action),
             Some(Selection::WorldNode(name)) => match world.node(&name) {
                 Some(node) => world_node_properties(ui, layout, world, node, action),
                 None => nothing_selected(ui, state),
@@ -932,6 +962,74 @@ fn nothing_selected(ui: &mut Ui, state: &mut EditState) {
         }
         ui.add_space(14.0);
     });
+}
+
+// シーンの照明 (アプリの太陽光と環境光)
+fn light_properties(ui: &mut Ui, layout: &mut SceneLayout, world: &WorldInfo, action: &mut Option<Action>) {
+    const LABEL: f32 = 72.0;
+    identity(ui, Icon::Sun, ICON_LIGHT, |ui| {
+        ui.label(RichText::new("ライト").size(13.0).color(TEXT_STRONG));
+        ui.label(RichText::new("太陽光の明るさと向き、環境光").size(10.5).color(TEXT_MUTED));
+    });
+
+    // ワールドのライトを使っていて、アプリの太陽光は消えているか
+    let sun_off = layout.world.is_some() && world.has_lights;
+    let light = &mut layout.light;
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing = vec2(4.0, 6.0);
+        widgets::sub_header(ui, "太陽光");
+        ui.horizontal(|ui| {
+            widgets::fixed_label(ui, LABEL, 24.0, "明るさ", 12.0, TEXT_LABEL, Align::Min);
+            NumberField::new(&mut light.illuminance, 50.0, 0)
+                .unit("lx")
+                .range(0.0..=200_000.0)
+                .show(ui, ui.available_width())
+                .on_hover_text("晴れた日中で 10000〜100000、曇りで 1000〜10000 くらい");
+        });
+        ui.horizontal(|ui| {
+            let width = (ui.available_width() - LABEL - 4.0) / 2.0;
+            widgets::fixed_label(ui, LABEL, 24.0, "向き", 12.0, TEXT_LABEL, Align::Min);
+            NumberField::new(&mut light.pitch_deg, 1.0, 1)
+                .prefix("傾き")
+                .unit("°")
+                .accent(AXIS_X)
+                .show(ui, width)
+                .on_hover_text("X軸まわりの角度。-90 で真上から、0 で水平に照らす");
+            NumberField::new(&mut light.yaw_deg, 1.0, 1)
+                .prefix("方角")
+                .unit("°")
+                .accent(AXIS_Y)
+                .show(ui, width)
+                .on_hover_text("Y軸まわりの角度。0 で手前から奥へ照らす");
+        });
+        if sun_off {
+            widgets::wrapped_label(
+                ui,
+                "ワールドにライトがあるため、この太陽光は消えています（環境光は効きます）。",
+                10.5,
+                Color32::from_rgb(0xf0, 0xb0, 0x5a),
+            );
+        }
+
+        widgets::sub_header(ui, "環境光");
+        ui.horizontal(|ui| {
+            widgets::fixed_label(ui, LABEL, 24.0, "明るさ", 12.0, TEXT_LABEL, Align::Min);
+            NumberField::new(&mut light.ambient, 1.0, 0)
+                .range(0.0..=5000.0)
+                .show(ui, ui.available_width())
+                .on_hover_text("影になる側が真っ黒にならないよう、全体をうっすら照らす光");
+        });
+    });
+
+    let is_default = layout.light == Default::default();
+    if Button::new("初期値に戻す", widgets::BUTTON)
+        .width(ui.available_width())
+        .enabled(!is_default)
+        .show(ui)
+        .clicked()
+    {
+        *action = Some(Action::ResetLight);
+    }
 }
 
 // ワールドのノード。触っていなければ Blender の値を出し、値を変えたら変更として記録する
@@ -1450,6 +1548,24 @@ fn save_as_dialog(ctx: &egui::Context, dialog: &mut SaveAsDialog, current: Optio
                     *action = Some(Action::CancelSaveAs);
                 }
             });
+        });
+    });
+}
+
+fn delete_scene_dialog(ctx: &egui::Context, name: &str, is_current: bool, action: &mut Option<Action>) {
+    let title = format!("シーン「{}」を削除しますか?", name);
+    let mut body = "シーンファイルを削除します。元に戻せません。ワールドやモデルのファイルは消えません。".to_string();
+    if is_current {
+        body.push_str("今開いているシーンなので、削除したあとは別のシーンを開きます。");
+    }
+    dialog(ctx, "confirm_delete_scene", 440.0, Icon::Trash, DANGER, &title, &body, |ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if dialog_button(ui, "削除する", widgets::BUTTON_DANGER_SOLID) {
+                *action = Some(Action::DeleteScene(name.to_string()));
+            }
+            if dialog_button(ui, "キャンセル", widgets::BUTTON_SECONDARY) {
+                *action = Some(Action::CancelDeleteScene);
+            }
         });
     });
 }

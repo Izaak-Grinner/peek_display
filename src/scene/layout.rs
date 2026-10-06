@@ -89,6 +89,41 @@ pub struct SceneObject {
     pub auto_fit: bool,
 }
 
+// シーンの照明。アプリが置く太陽光 (平行光源) と、全体をうっすら照らす環境光
+#[derive(Clone, Debug, PartialEq)]
+pub struct LightSettings {
+    // 太陽光の明るさ (ルクス)
+    pub illuminance: f32,
+    // 環境光の明るさ
+    pub ambient: f32,
+    // 太陽光の向き。X軸まわり (傾き) と Y軸まわり (方角) の角度 (度)
+    pub pitch_deg: f32,
+    pub yaw_deg: f32,
+}
+
+impl Default for LightSettings {
+    // 手前の上から、奥へ斜め下に照らす (のぞき窓から見える面が明るくなる)
+    fn default() -> Self {
+        Self {
+            illuminance: 10_000.0,
+            ambient: 80.0,
+            pitch_deg: -57.3,
+            yaw_deg: 0.0,
+        }
+    }
+}
+
+impl LightSettings {
+    pub fn rotation(&self) -> Quat {
+        Quat::from_euler(EulerRot::YXZ, self.yaw_deg.to_radians(), self.pitch_deg.to_radians(), 0.0)
+    }
+
+    // 光が進む向き
+    pub fn direction(&self) -> Vec3 {
+        self.rotation() * Vec3::NEG_Z
+    }
+}
+
 // ワールド(.glb)の中のノードに対する、アプリでの変更。ノードは Blender のオブジェクト名で区別する
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorldOverride {
@@ -105,6 +140,7 @@ pub struct SceneLayout {
     pub world: Option<String>,
     // のぞき窓の中心と向き (scale は使わない)
     pub window: Placement,
+    pub light: LightSettings,
     pub world_overrides: Vec<WorldOverride>,
     pub objects: Vec<SceneObject>,
     // ワールドの読み込みが終わったら、のぞき窓を peek_window の位置に合わせる (保存しない)
@@ -148,6 +184,7 @@ impl SceneLayout {
         Self {
             world: None,
             window: Placement::default(),
+            light: LightSettings::default(),
             world_overrides: Vec::new(),
             objects: Vec::new(),
             window_from_world: false,
@@ -211,6 +248,7 @@ impl SceneLayout {
     pub fn same_content(&self, other: &Self) -> bool {
         self.world == other.world
             && self.window == other.window
+            && self.light == other.light
             && self.world_overrides == other.world_overrides
             && self.objects.len() == other.objects.len()
             && self.objects.iter().zip(&other.objects).all(|(a, b)| {
@@ -235,6 +273,7 @@ impl SceneLayout {
         }
         self.world = other.world;
         self.window = other.window;
+        self.light = other.light;
         self.world_overrides = other.world_overrides;
         self.objects = other.objects;
         self.window_from_world = other.window_from_world;
@@ -245,6 +284,7 @@ impl SceneLayout {
         enum Section {
             World,
             Window,
+            Light,
             WorldNode(usize),
             Object(u64),
             Unknown,
@@ -262,6 +302,7 @@ impl SceneLayout {
                 section = match name.trim() {
                     "world" => Section::World,
                     "window" => Section::Window,
+                    "light" => Section::Light,
                     "world_node" => {
                         layout.world_overrides.push(WorldOverride {
                             node: String::new(),
@@ -308,6 +349,16 @@ impl SceneLayout {
                 Section::Window => {
                     if !parse_placement(&mut layout.window, key, value, false) {
                         warn!("{}: 不明な設定項目を無視しました: {}", SCENE_FILE_NAME, key);
+                    }
+                }
+                Section::Light => {
+                    let light = &mut layout.light;
+                    match key {
+                        "illuminance" => light.illuminance = parse_or_warn(SCENE_FILE_NAME, key, value, light.illuminance),
+                        "ambient" => light.ambient = parse_or_warn(SCENE_FILE_NAME, key, value, light.ambient),
+                        "pitch" => light.pitch_deg = parse_or_warn(SCENE_FILE_NAME, key, value, light.pitch_deg),
+                        "yaw" => light.yaw_deg = parse_or_warn(SCENE_FILE_NAME, key, value, light.yaw_deg),
+                        _ => warn!("{}: 不明な設定項目を無視しました: {}", SCENE_FILE_NAME, key),
                     }
                 }
                 Section::WorldNode(i) => {
@@ -376,6 +427,14 @@ impl SceneLayout {
         let _ = writeln!(text, "# のぞき窓 = ディスプレイ面の中心と向き");
         let _ = writeln!(text, "[window]");
         write_placement(&mut text, &self.window, false);
+
+        let _ = writeln!(text);
+        let _ = writeln!(text, "# 照明。illuminance = 太陽光の明るさ(ルクス)、ambient = 環境光の明るさ、pitch/yaw = 太陽光の向き(度)");
+        let _ = writeln!(text, "[light]");
+        let _ = writeln!(text, "illuminance={}", self.light.illuminance);
+        let _ = writeln!(text, "ambient={}", self.light.ambient);
+        let _ = writeln!(text, "pitch={}", self.light.pitch_deg);
+        let _ = writeln!(text, "yaw={}", self.light.yaw_deg);
 
         for o in &self.world_overrides {
             let _ = writeln!(text);

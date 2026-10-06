@@ -344,6 +344,11 @@ mod tests {
         // ワールドとノードの変更も含める (ワールドには assets にある glb を使う)
         layout.world = Some("models/test/ke1.glb".to_string());
         layout.world_override_mut("Cube").hidden = true;
+        // ライトの設定も含める
+        layout.light.illuminance = 1234.0;
+        layout.light.ambient = 20.0;
+        layout.light.pitch_deg = -30.0;
+        layout.light.yaw_deg = 45.0;
         layout.world_override_mut("Light").placement = Some(Placement {
             position: Vec3::new(0.1, 0.2, 0.3),
             yaw_deg: 30.0,

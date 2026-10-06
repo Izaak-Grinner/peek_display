@@ -41,7 +41,7 @@ fn selected_entity(
     match state.selection.as_ref()? {
         Selection::Object(id) => placeables.iter().find(|(_, p)| p.0 == *id).map(|(e, _)| e),
         Selection::WorldNode(name) => world.node(name).map(|n| n.entity),
-        Selection::Window => None,
+        Selection::Window | Selection::Light => None,
     }
 }
 

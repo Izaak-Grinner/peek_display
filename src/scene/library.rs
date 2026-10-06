@@ -100,6 +100,18 @@ impl SceneLibrary {
         Ok(())
     }
 
+    // 保存してあるシーンを削除する (ワールドやモデルのファイルはほかのシーンでも使えるので消さない)。
+    // 今のシーンを削除したときは、名前の無いシーンになる
+    pub fn delete(&mut self, name: &str) -> Result<(), String> {
+        std::fs::remove_file(path(name))
+            .map_err(|e| format!("シーン「{}」を削除できませんでした ({})", name, e))?;
+        if self.current.as_deref() == Some(name) {
+            self.current = None;
+        }
+        info!("シーン「{}」を削除しました", name);
+        Ok(())
+    }
+
     // 最後に開いていたシーン (current.txt) を開き直す。無ければ空のシーンにする
     pub fn reopen_last(&mut self) -> SceneLayout {
         let remembered = std::fs::read_to_string(dir().join(CURRENT_FILE))

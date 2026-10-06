@@ -12,6 +12,7 @@ impl Plugin for ScenePlugin {
                 Update,
                 (
                     sync_scene_objects.run_if(resource_changed::<SceneLayout>),
+                    apply_light.run_if(resource_changed::<SceneLayout>),
                     auto_fit_imported,
                 )
                     .chain(),
@@ -44,6 +45,27 @@ fn setup_light(mut commands: Commands) {
         DirectionalLight::default(),
         Transform::from_rotation(Quat::from_rotation_x(-1.0)),
     ));
+}
+
+// シーンの照明の設定を、アプリの太陽光と環境光に反映する
+fn apply_light(
+    layout: Res<SceneLayout>,
+    mut lights: Query<(&mut DirectionalLight, &mut Transform), With<DefaultLight>>,
+    mut ambient: ResMut<AmbientLight>,
+) {
+    let settings = &layout.light;
+    for (mut light, mut transform) in &mut lights {
+        if light.illuminance != settings.illuminance {
+            light.illuminance = settings.illuminance;
+        }
+        let rotation = settings.rotation();
+        if transform.rotation != rotation {
+            transform.rotation = rotation;
+        }
+    }
+    if ambient.brightness != settings.ambient {
+        ambient.brightness = settings.ambient;
+    }
 }
 
 // SceneLayout の内容に合わせて、オブジェクトの追加・削除・移動を反映する

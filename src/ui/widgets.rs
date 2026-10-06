@@ -50,6 +50,7 @@ pub mod color {
 
     pub const ICON_WINDOW: Color32 = hex(0x6fa8ff);
     pub const ICON_MODEL: Color32 = hex(0xe6a95c);
+    pub const ICON_LIGHT: Color32 = hex(0xf2d06b);
     pub const ICON_CUBE: Color32 = hex(0xb9b9b9);
 
     pub const WARN: Color32 = hex(0xf0a640);
@@ -72,6 +73,7 @@ pub fn hairline(color: Color32) -> Stroke {
 #[derive(Clone, Copy)]
 pub enum Icon {
     Monitor,
+    Sun,
     Model,
     Cube,
     Copy,
@@ -116,6 +118,14 @@ pub fn draw_icon(painter: &Painter, rect: Rect, icon: Icon, color: Color32, widt
             );
             line(&[(5.0, 12.5), (9.0, 12.5)]);
             line(&[(7.0, 10.0), (7.0, 12.5)]);
+        }
+        Icon::Sun => {
+            painter.circle_stroke(p(7.0, 7.0), 2.6 * s, stroke);
+            for i in 0..8 {
+                let a = i as f32 / 8.0 * std::f32::consts::TAU;
+                let (c, sn) = (a.cos(), a.sin());
+                line(&[(7.0 + c * 4.3, 7.0 + sn * 4.3), (7.0 + c * 6.0, 7.0 + sn * 6.0)]);
+            }
         }
         Icon::Model => {
             painter.circle_stroke(p(7.0, 7.0), 5.5 * s, stroke);
