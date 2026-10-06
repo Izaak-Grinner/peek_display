@@ -1,0 +1,10 @@
+# Rust のビルド出力
+/target
+
+# OS固有の不要ファイル
+.DS_Store
+Thumbs.db
+
+# ローカル環境固有の設定（もしあれば）
+/config.local.toml
+/config.ini
