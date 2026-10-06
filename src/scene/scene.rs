@@ -106,6 +106,45 @@ fn spawn_object(
     }
 }
 
+// メッシュの Aabb とワールド座標 (大きさを求めるときに使う)
+pub type MeshBoundsQuery<'w, 's> = Query<'w, 's, (Option<&'static Aabb>, &'static GlobalTransform), With<Mesh3d>>;
+
+// entity とその子孫のメッシュ全体を囲む箱 (ワールド座標の min, max)。
+// まだシーンが展開されていない、または Aabb が計算されていないときは None
+pub fn mesh_bounds(
+    entity: Entity,
+    children: &Query<&Children>,
+    meshes: &MeshBoundsQuery,
+) -> Option<(Vec3, Vec3)> {
+    let mut min = Vec3::splat(f32::MAX);
+    let mut max = Vec3::splat(f32::MIN);
+    let mut mesh_count = 0;
+
+    for target in std::iter::once(entity).chain(children.iter_descendants(entity)) {
+        let Ok((aabb, global)) = meshes.get(target) else {
+            continue;
+        };
+        mesh_count += 1;
+        let aabb = aabb?;
+        let (center, half) = (Vec3::from(aabb.center), Vec3::from(aabb.half_extents));
+        for corner in [
+            Vec3::new(-1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, 1.0),
+            Vec3::new(-1.0, 1.0, -1.0),
+            Vec3::new(-1.0, 1.0, 1.0),
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(1.0, -1.0, 1.0),
+            Vec3::new(1.0, 1.0, -1.0),
+            Vec3::new(1.0, 1.0, 1.0),
+        ] {
+            let p = global.transform_point(center + half * corner);
+            min = min.min(p);
+            max = max.max(p);
+        }
+    }
+    (mesh_count > 0).then_some((min, max))
+}
+
 // インポートしたモデルの読み込みが終わったら、最大辺が AUTO_FIT_SIZE になるよう縮尺を決め、
 // 底面を床に合わせる。メッシュの Aabb は PostUpdate で計算されるので、揃うまで毎フレーム待つ
 fn auto_fit_imported(
@@ -113,44 +152,12 @@ fn auto_fit_imported(
     mut layout: ResMut<SceneLayout>,
     targets: Query<(Entity, &Placeable), With<AutoFit>>,
     children: Query<&Children>,
-    meshes: Query<(Option<&Aabb>, &GlobalTransform), With<Mesh3d>>,
+    meshes: MeshBoundsQuery,
 ) {
     for (entity, placeable) in &targets {
-        let mut min = Vec3::splat(f32::MAX);
-        let mut max = Vec3::splat(f32::MIN);
-        let mut mesh_count = 0;
-        let mut ready = true;
-
-        for descendant in children.iter_descendants(entity) {
-            let Ok((aabb, global)) = meshes.get(descendant) else {
-                continue;
-            };
-            mesh_count += 1;
-            let Some(aabb) = aabb else {
-                ready = false;
-                break;
-            };
-            let (center, half) = (Vec3::from(aabb.center), Vec3::from(aabb.half_extents));
-            for corner in [
-                Vec3::new(-1.0, -1.0, -1.0),
-                Vec3::new(-1.0, -1.0, 1.0),
-                Vec3::new(-1.0, 1.0, -1.0),
-                Vec3::new(-1.0, 1.0, 1.0),
-                Vec3::new(1.0, -1.0, -1.0),
-                Vec3::new(1.0, -1.0, 1.0),
-                Vec3::new(1.0, 1.0, -1.0),
-                Vec3::new(1.0, 1.0, 1.0),
-            ] {
-                let p = global.transform_point(center + half * corner);
-                min = min.min(p);
-                max = max.max(p);
-            }
-        }
-
-        // まだシーンが展開されていない、または Aabb が計算されていない
-        if mesh_count == 0 || !ready {
+        let Some((min, max)) = mesh_bounds(entity, &children, &meshes) else {
             continue;
-        }
+        };
 
         commands.entity(entity).remove::<AutoFit>();
         let Some(object) = layout.object_mut(placeable.0) else {

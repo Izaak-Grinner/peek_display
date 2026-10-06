@@ -218,6 +218,14 @@ impl SceneLayout {
             })
     }
 
+    // 元に戻す・やり直しで、同じシーンの以前の状態に戻す。
+    // id はそのまま使い、残っているオブジェクトのエンティティを使い回す
+    pub fn restore(&mut self, snapshot: &Self) {
+        let next_id = self.next_id.max(snapshot.next_id);
+        *self = snapshot.clone();
+        self.next_id = next_id;
+    }
+
     // 別のシーンに入れ替える。id は今の続きから振り直し、
     // 既存のエンティティが別のオブジェクトと取り違えられないようにする
     pub fn replace_with(&mut self, mut other: Self) {

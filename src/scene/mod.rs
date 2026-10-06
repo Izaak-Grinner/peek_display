@@ -5,3 +5,4 @@ pub mod scene;
 pub mod package;
 pub mod library;
 pub mod world;
+pub mod highlight;

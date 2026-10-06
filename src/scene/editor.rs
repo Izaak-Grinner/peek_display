@@ -4,6 +4,7 @@ use crate::app_mode::AppMode;
 use crate::config::AppConfig;
 use crate::scene::layout::{Placement, SceneLayout};
 use crate::scene::library::{self, SceneLibrary};
+use crate::scene::highlight::SELECTION_COLOR;
 use crate::scene::scene::Placeable;
 use crate::scene::world::{self, WorldInfo, WorldNode};
 use crate::ui::UiInputState;
@@ -57,6 +58,39 @@ pub struct SaveAsDialog {
     pub then: Option<Pending>,
 }
 
+// 元に戻せる回数
+const HISTORY_LIMIT: usize = 100;
+
+// 元に戻す・やり直しで記録する状態
+#[derive(Clone)]
+struct Snapshot {
+    layout: SceneLayout,
+    config: AppConfig,
+}
+
+impl Snapshot {
+    fn new(layout: &SceneLayout, config: &AppConfig) -> Self {
+        Self {
+            layout: layout.clone(),
+            config: config.clone(),
+        }
+    }
+
+    fn same_as(&self, layout: &SceneLayout, config: &AppConfig) -> bool {
+        self.layout.same_content(layout) && self.config == *config
+    }
+}
+
+// 元に戻す・やり直しの履歴。
+// ドラッグやキーを押し続けての移動は、手を離したときに1回分としてまとめる
+#[derive(Default)]
+struct History {
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
+    // 最後に確定した状態。今の状態と違えば、確定していない変更がある
+    settled: Option<Snapshot>,
+}
+
 // 編集モードの状態。保存済みの内容を持っておき、未保存の変更があるか比べる
 #[derive(Resource)]
 pub struct EditState {
@@ -70,6 +104,7 @@ pub struct EditState {
     pub confirm_delete: Option<u64>,
     saved_layout: SceneLayout,
     saved_config: AppConfig,
+    history: History,
 }
 
 impl FromWorld for EditState {
@@ -83,6 +118,7 @@ impl FromWorld for EditState {
             confirm_delete: None,
             saved_layout: world.resource::<SceneLayout>().clone(),
             saved_config: world.resource::<AppConfig>().clone(),
+            history: History::default(),
         }
     }
 }
@@ -144,11 +180,75 @@ impl EditState {
         self.saved_layout = layout.clone();
     }
 
-    // 別のシーンに切り替えたとき。その内容を保存済みの状態とする
+    // 別のシーンに切り替えたとき。その内容を保存済みの状態とし、元に戻す履歴は消す
     pub fn scene_switched(&mut self, layout: &SceneLayout) {
         self.saved_layout = layout.clone();
         self.selection = None;
         self.save_status = None;
+        self.confirm_delete = None;
+        self.history = History::default();
+    }
+
+    // 変更を履歴に記録する。idle: マウスもキーも押していない (ドラッグなどが終わった)
+    fn track_history(&mut self, layout: &SceneLayout, config: &AppConfig, idle: bool) {
+        // 読み込み直後の自動調整は、取り込みと一緒に1回分にする
+        let adjusting = layout.window_from_world || layout.objects.iter().any(|o| o.auto_fit);
+        let Some(settled) = &self.history.settled else {
+            self.history.settled = Some(Snapshot::new(layout, config));
+            return;
+        };
+        if !idle || adjusting || settled.same_as(layout, config) {
+            return;
+        }
+        self.commit(layout, config);
+    }
+
+    // 確定していない変更を、1回分として履歴に積む
+    fn commit(&mut self, layout: &SceneLayout, config: &AppConfig) {
+        let Some(settled) = self.history.settled.replace(Snapshot::new(layout, config)) else {
+            return;
+        };
+        if settled.same_as(layout, config) {
+            return;
+        }
+        self.history.undo.push(settled);
+        if self.history.undo.len() > HISTORY_LIMIT {
+            self.history.undo.remove(0);
+        }
+        self.history.redo.clear();
+    }
+
+    pub fn can_undo(&self, layout: &SceneLayout, config: &AppConfig) -> bool {
+        !self.history.undo.is_empty()
+            || self.history.settled.as_ref().is_some_and(|s| !s.same_as(layout, config))
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.history.redo.is_empty()
+    }
+
+    pub fn undo(&mut self, layout: &mut SceneLayout, config: &mut AppConfig) {
+        self.commit(layout, config);
+        let Some(previous) = self.history.undo.pop() else {
+            return;
+        };
+        self.history.redo.push(Snapshot::new(layout, config));
+        self.apply(previous, layout, config);
+    }
+
+    pub fn redo(&mut self, layout: &mut SceneLayout, config: &mut AppConfig) {
+        self.commit(layout, config);
+        let Some(next) = self.history.redo.pop() else {
+            return;
+        };
+        self.history.undo.push(Snapshot::new(layout, config));
+        self.apply(next, layout, config);
+    }
+
+    fn apply(&mut self, snapshot: Snapshot, layout: &mut SceneLayout, config: &mut AppConfig) {
+        layout.restore(&snapshot.layout);
+        *config = snapshot.config.clone();
+        self.history.settled = Some(snapshot);
         self.confirm_delete = None;
     }
 
@@ -197,7 +297,9 @@ impl Plugin for EditorPlugin {
             .add_observer(select_on_click)
             .add_systems(
                 Update,
-                (keyboard_edit, draw_selection).run_if(in_state(AppMode::Edit)),
+                (keyboard_edit, track_history, draw_selection)
+                    .chain()
+                    .run_if(in_state(AppMode::Edit)),
             );
     }
 }
@@ -313,44 +415,125 @@ fn keyboard_edit(
 }
 
 
+// 変更を元に戻す履歴に記録する
+fn track_history(
+    keys: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    ui_input: Res<UiInputState>,
+    layout: Res<SceneLayout>,
+    config: Res<AppConfig>,
+    mut state: ResMut<EditState>,
+) {
+    // 文字を入力している間は、入力が終わってからまとめて記録する
+    let idle = keys.get_pressed().next().is_none() && mouse.get_pressed().next().is_none() && !ui_input.keyboard;
+    state.bypass_change_detection().track_history(&layout, &config, idle);
+}
+
 // 選択中の対象に目印を描く (ギズモは俯瞰カメラにしか映らない)
 fn draw_selection(
     mut gizmos: Gizmos,
     state: Res<EditState>,
-    layout: Res<SceneLayout>,
-    config: Res<AppConfig>,
     world: Res<WorldInfo>,
     globals: Query<&GlobalTransform>,
+    placeables: Query<(Entity, &Placeable)>,
 ) {
-    let highlight = LinearRgba::new(1.0, 0.9, 0.0, 1.0);
-    match &state.selection {
-        Some(Selection::Window) => {
-            let (width, height) = config.screen_size();
-            gizmos.rect(
-                Isometry3d::new(layout.window.position, layout.window.rotation()),
-                Vec2::new(width, height) * 1.05,
-                highlight,
-            );
+    let color = LinearRgba::from(SELECTION_COLOR);
+    // オブジェクトの縁取りは highlight.rs。ここでは回転・拡大の中心 (原点) に小さな点を描く
+    let origin = |gizmos: &mut Gizmos, entity: Entity| {
+        if let Ok(global) = globals.get(entity) {
+            gizmos.sphere(global.translation(), 0.006, color);
         }
+    };
+    match &state.selection {
+        // のぞき窓の縁取りは preview.rs (枠・視線・目の位置をまとめて縁取る)
+        Some(Selection::Window) => {}
         Some(Selection::Object(id)) => {
-            if let Some(object) = layout.object(*id) {
-                let placement = &object.placement;
-                gizmos.axes(
-                    Transform::from_translation(placement.position)
-                        .with_rotation(placement.rotation()),
-                    0.1,
-                );
-                gizmos.sphere(placement.position, 0.01, highlight);
+            if let Some((entity, _)) = placeables.iter().find(|(_, p)| p.0 == *id) {
+                origin(&mut gizmos, entity);
             }
         }
         Some(Selection::WorldNode(name)) => {
-            let global = world.node(name).and_then(|n| globals.get(n.entity).ok());
-            if let Some(global) = global {
-                let (_, rotation, translation) = global.to_scale_rotation_translation();
-                gizmos.axes(Transform::from_translation(translation).with_rotation(rotation), 0.1);
-                gizmos.sphere(translation, 0.01, highlight);
+            if let Some(node) = world.node(name) {
+                origin(&mut gizmos, node.entity);
             }
         }
         None => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup() -> (EditState, SceneLayout, AppConfig) {
+        let mut world = World::new();
+        world.insert_resource(SceneLayout::default());
+        world.insert_resource(AppConfig::default());
+        let state = EditState::from_world(&mut world);
+        let layout = world.resource::<SceneLayout>().clone();
+        let config = world.resource::<AppConfig>().clone();
+        (state, layout, config)
+    }
+
+    // ドラッグ中の変更は手を離したときに1回分になり、元に戻す・やり直しで行き来できる
+    #[test]
+    fn undo_redo_groups_changes_until_idle() {
+        let (mut state, mut layout, mut config) = setup();
+        state.track_history(&layout, &config, true);
+        let start = layout.window.position;
+
+        // 押している間に2回動かす → まだ確定しない
+        layout.window.position.x += 0.1;
+        state.track_history(&layout, &config, false);
+        layout.window.position.x += 0.1;
+        state.track_history(&layout, &config, false);
+        // 離したら1回分として確定
+        state.track_history(&layout, &config, true);
+        let moved = layout.window.position;
+
+        // 画面サイズの変更も1回分
+        config.screen_diagonal_inches += 1.0;
+        state.track_history(&layout, &config, true);
+
+        state.undo(&mut layout, &mut config);
+        assert_eq!(config.screen_diagonal_inches, AppConfig::default().screen_diagonal_inches);
+        assert_eq!(layout.window.position, moved);
+        state.undo(&mut layout, &mut config);
+        assert_eq!(layout.window.position, start);
+        assert!(!state.can_undo(&layout, &config));
+
+        state.redo(&mut layout, &mut config);
+        assert_eq!(layout.window.position, moved);
+        assert!(state.can_redo());
+
+        // 新しく変更したら、やり直しの履歴は消える
+        layout.window.position.y += 0.2;
+        state.track_history(&layout, &config, true);
+        assert!(!state.can_redo());
+    }
+
+    // 削除したオブジェクトは同じ id で戻る
+    #[test]
+    fn undo_restores_deleted_object_with_same_id() {
+        let (mut state, mut layout, mut config) = setup();
+        state.track_history(&layout, &config, true);
+        let id = layout.objects[0].id;
+        layout.objects.retain(|o| o.id != id);
+        state.track_history(&layout, &config, true);
+        state.undo(&mut layout, &mut config);
+        assert!(layout.object(id).is_some());
+    }
+
+    // 確定していない変更 (押している最中) も元に戻せる
+    #[test]
+    fn undo_commits_pending_change_first() {
+        let (mut state, mut layout, mut config) = setup();
+        state.track_history(&layout, &config, true);
+        let start = layout.window.position;
+        layout.window.position.z -= 0.3;
+        state.track_history(&layout, &config, false);
+        assert!(state.can_undo(&layout, &config));
+        state.undo(&mut layout, &mut config);
+        assert_eq!(layout.window.position, start);
     }
 }

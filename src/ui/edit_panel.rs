@@ -27,15 +27,6 @@ const INSET_WIDTH_RANGE: (f32, f32) = (200.0, 480.0);
 const INSET_MAX_HEIGHT_RATIO: f32 = 0.45;
 const INSET_MARGIN: f32 = 12.0;
 
-// 3D ビューの上に重ねるボタン (半透明の黒)
-const OVERLAY_BUTTON: widgets::ButtonStyle = widgets::ButtonStyle {
-    fill: Color32::from_rgba_premultiplied(17, 17, 17, 217),
-    hover: Color32::from_rgba_premultiplied(40, 40, 40, 230),
-    border: Color32::from_rgb(0x3a, 0x3a, 0x3a),
-    text: Color32::from_rgb(0xc4, 0xc4, 0xc4),
-    ..widgets::BUTTON
-};
-
 // 複製したオブジェクトをずらす量(メートル)
 const DUPLICATE_OFFSET: Vec3 = Vec3::new(0.05, 0.0, 0.0);
 
@@ -43,9 +34,10 @@ const DUPLICATE_OFFSET: Vec3 = Vec3::new(0.05, 0.0, 0.0);
 const ASPECT_PRESETS: [(f32, f32); 3] = [(16.0, 9.0), (16.0, 10.0), (3.0, 2.0)];
 
 // 編集モードの操作方法。メニューの「ヘルプ → 操作方法」にまとめて出す
-const HELP_ROWS: [(&str, &str); 17] = [
+const HELP_ROWS: [(&str, &str); 19] = [
     ("左クリック", "オブジェクトを選択(一覧か3Dビュー。壁や床で選択を外す)"),
     ("右ドラッグ / ホイール", "視点の回転 / ズーム"),
+    ("ホイールを押しながらドラッグ", "視点の平行移動"),
     ("矢印キー", "移動(↑↓ = Z軸、←→ = X軸)"),
     ("PageUp / PageDown", "上下に移動"),
     ("R / F", "X軸まわりに回転"),
@@ -53,6 +45,7 @@ const HELP_ROWS: [(&str, &str); 17] = [
     ("Z / X", "Z軸まわりに回転"),
     ("+ / -", "拡大・縮小"),
     ("Shift を押しながら", "ゆっくり動かす(速さ1/10)"),
+    ("Ctrl+Z / Ctrl+Shift+Z", "元に戻す / やり直し (Ctrl+Y でもやり直し)"),
     ("Ctrl+D", "選択中のオブジェクトを複製"),
     ("Delete", "選択中のオブジェクトを削除(ワールドのものは非表示に切り替え)"),
     ("Ctrl+N", "新規シーン"),
@@ -82,6 +75,8 @@ enum Action {
     SaveAndContinue,
     DiscardAndContinue,
     CancelDiscard,
+    Undo,
+    Redo,
     ExportScene,
     ImportModel,
     ReloadWorld,
@@ -136,7 +131,7 @@ pub fn edit_panel(
             .show_separator_line(false)
             .frame(egui::Frame::new().fill(BAR).inner_margin(Margin::symmetric(6, 0)))
             .show(ctx, |ui| {
-                menu_bar(ui, layout, state, library, &import, &package, &mut inset, &mut panel, dirty, &mut action)
+                menu_bar(ui, layout, config, state, library, &import, &package, &mut inset, &mut panel, dirty, &mut action)
             });
         let menu_rect = menu.response.rect;
         ctx.layer_painter(egui::LayerId::background())
@@ -217,6 +212,10 @@ pub fn edit_panel(
                     action = Some(Action::Request(Pending::Exit));
                 } else if ctrl && keyboard.just_pressed(KeyCode::KeyS) {
                     action = Some(if shift { Action::SaveAs } else { Action::Save });
+                } else if ctrl && keyboard.just_pressed(KeyCode::KeyZ) {
+                    action = Some(if shift { Action::Redo } else { Action::Undo });
+                } else if ctrl && keyboard.just_pressed(KeyCode::KeyY) {
+                    action = Some(Action::Redo);
                 } else if ctrl && keyboard.just_pressed(KeyCode::KeyN) {
                     action = Some(Action::Request(Pending::New));
                 } else if let Some(Selection::Object(id)) = state.selection {
@@ -304,6 +303,8 @@ pub fn edit_panel(
                 files.state.confirm_delete = None;
             }
             Some(Action::CancelDelete) => files.state.confirm_delete = None,
+            Some(Action::Undo) => files.state.undo(files.layout, files.config),
+            Some(Action::Redo) => files.state.redo(files.layout, files.config),
             None => {}
         }
     }
@@ -423,6 +424,7 @@ fn open_scenes_folder() {
 fn menu_bar(
     ui: &mut Ui,
     layout: &SceneLayout,
+    config: &AppConfig,
     state: &EditState,
     library: &SceneLibrary,
     import: &ImportState,
@@ -436,6 +438,12 @@ fn menu_bar(
     egui::MenuBar::new().ui(ui, |ui| {
         ui.set_height(MENU_BAR_HEIGHT);
         ui.spacing_mut().item_spacing.x = 2.0;
+
+        // ホームへ戻る (メニューを開かずにすぐ戻る。未保存の変更があれば確認する)
+        if ui.add(egui::Button::new("ホーム").frame_when_inactive(false)).clicked() {
+            set(Action::Request(Pending::Exit));
+        }
+        ui.separator();
 
         ui.menu_button("ファイル", |ui| {
             ui.set_min_width(220.0);
@@ -489,14 +497,17 @@ fn menu_bar(
             if ui.add_enabled(layout.world.is_some(), egui::Button::new("ワールドを再読み込み")).clicked() {
                 set(Action::ReloadWorld);
             }
-            ui.separator();
-            if ui.button("ホームへ戻る").clicked() {
-                set(Action::Request(Pending::Exit));
-            }
         });
 
         ui.menu_button("編集", |ui| {
             ui.set_min_width(180.0);
+            if ui.add_enabled(state.can_undo(layout, config), egui::Button::new("元に戻す")).clicked() {
+                set(Action::Undo);
+            }
+            if ui.add_enabled(state.can_redo(), egui::Button::new("やり直し")).clicked() {
+                set(Action::Redo);
+            }
+            ui.separator();
             let selected = match state.selection {
                 Some(Selection::Object(id)) if layout.object(id).is_some() => Some(id),
                 _ => None,
@@ -587,22 +598,6 @@ fn viewport_overlay(
                 ui.spacing_mut().item_spacing.x = 6.0;
                 overlay_chip(ui, "俯瞰ビュー", 12.0, TEXT);
             });
-        });
-
-    // 覗き込みカメラの小窓の表示切り替え (3D ビューの右上)
-    egui::Area::new(egui::Id::new("main_camera_toggle"))
-        .fixed_pos(egui::pos2(view.right() - 12.0, view.top() + 12.0))
-        .pivot(Align2::RIGHT_TOP)
-        .show(ctx, |ui| {
-            let label = if inset.visible { "覗き込みカメラを隠す" } else { "覗き込みカメラを表示" };
-            let toggle = Button::new(label, OVERLAY_BUTTON)
-                .colored_icon(Icon::Monitor, ICON_WINDOW)
-                .height(26.0)
-                .font_size(11.0)
-                .show(ui);
-            if toggle.clicked() {
-                inset.visible = !inset.visible;
-            }
         });
 
     if !inset.visible {

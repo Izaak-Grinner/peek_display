@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 bevy = { version = "0.17" }
 bevy_egui = "0.38"
+bevy_mod_outline = "0.11"
 rfd = "0.17"
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
 

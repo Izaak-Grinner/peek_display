@@ -5,14 +5,14 @@ use crate::config::AppConfig;
 
 #[derive(States, Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AppMode {
-    // モードを選ぶ画面 (背景に俯瞰カメラ)
+    // モードを選ぶ画面 (背景に俯瞰カメラ)。起動したらここから始まる
+    #[default]
     Home,
     // 展示用。覗き込みカメラだけを全画面表示する
     Production,
     // 左に俯瞰カメラ、右に覗き込みカメラ
     Inspection,
     // オブジェクトの配置と覗き込みカメラの設定
-    #[default]
     Edit,
 }
 

@@ -22,6 +22,7 @@ fn main() {
             scene::import::ImportPlugin,
             scene::package::PackagePlugin,
             scene::world::WorldPlugin,
+            scene::highlight::HighlightPlugin,
             camera::main_camera::MainCameraPlugin,
             camera::inset::InsetPlugin,
             camera::preview::PreviewPlugin,
