@@ -2,6 +2,7 @@ use bevy::{camera::primitives::Aabb, prelude::*};
 use std::collections::HashSet;
 
 use crate::scene::layout::{FLOOR_Y, ObjectKind, SceneLayout, SceneObject};
+use crate::scene::package_store::PackageStore;
 
 pub struct ScenePlugin;
 
@@ -73,6 +74,7 @@ fn sync_scene_objects(
     mut commands: Commands,
     layout: Res<SceneLayout>,
     asset_server: Res<AssetServer>,
+    store: Res<PackageStore>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut placeables: Query<(Entity, &Placeable, &mut Transform)>,
@@ -96,6 +98,7 @@ fn sync_scene_objects(
         spawn_object(
             &mut commands,
             &asset_server,
+            &store,
             &mut meshes,
             &mut materials,
             object,
@@ -106,6 +109,7 @@ fn sync_scene_objects(
 fn spawn_object(
     commands: &mut Commands,
     asset_server: &AssetServer,
+    store: &PackageStore,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     object: &SceneObject,
@@ -113,7 +117,8 @@ fn spawn_object(
     let transform = object.placement.to_transform();
     let mut entity = match &object.kind {
         ObjectKind::Model { path } => commands.spawn((
-            SceneRoot(asset_server.load(GltfAssetLabel::Scene(0).from_asset(path.clone()))),
+            // シーンの中のファイルから読み込む (peek://<番号>/<path>)
+            SceneRoot(asset_server.load(GltfAssetLabel::Scene(0).from_asset(store.asset_path(path)))),
             transform,
         )),
         ObjectKind::Cube { color, size } => commands.spawn((

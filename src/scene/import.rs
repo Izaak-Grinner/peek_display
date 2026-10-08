@@ -1,15 +1,20 @@
+// モデル・ワールドの取り込み。ファイルを読み込み、開いているシーン (.peek) の中に入れる
+// (assets フォルダにはコピーしない。シーンを保存すると .peek に入る)
 use bevy::prelude::*;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
+use crate::config::DisplayInfo;
 use crate::scene::editor::{EditState, SaveStatus, Selection};
 use crate::scene::layout::{FLOOR_Y, ObjectKind, Placement, SceneLayout};
 use crate::scene::library::{self, SceneLibrary};
+use crate::scene::package::{PackageFiles, is_inside};
+use crate::scene::package_store::PackageStore;
 
-// インポートしたモデルとワールドを置く場所 (assets フォルダからの相対パス)
-pub(super) const MODEL_DIR: &str = "models/imported";
-pub(super) const WORLD_DIR: &str = "worlds";
+// シーンの中で、追加したモデルとワールドを置くフォルダ
+const MODEL_DIR: &str = "models";
+const WORLD_DIR: &str = "world";
 
 // 何を取り込むか
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,13 +28,37 @@ pub enum ImportKind {
 // のぞき窓からどれだけ奥に置くか(メートル)
 const IMPORT_DISTANCE: f32 = 0.4;
 
+// 読み込んだモデルのファイル。files のパスは、本体のファイルがあるフォルダからの相対パス
+pub struct ModelFiles {
+    pub main: String,
+    pub files: Vec<(String, Vec<u8>)>,
+}
+
+impl ModelFiles {
+    // folder の下に置いたときのファイル一覧と、本体のパス
+    pub fn placed_in(self, folder: &str) -> (String, PackageFiles) {
+        let main = format!("{}/{}", folder, self.main);
+        let files = self
+            .files
+            .into_iter()
+            .map(|(rel, bytes)| (format!("{}/{}", folder, rel), bytes))
+            .collect();
+        (main, files)
+    }
+}
+
 enum ImportResult {
     Cancelled,
-    Imported { kind: ImportKind, asset_path: String, name: String },
+    Imported {
+        kind: ImportKind,
+        source: PathBuf,
+        model: ModelFiles,
+        name: String,
+    },
     Failed(String),
 }
 
-// ファイル選択ダイアログとコピーは別スレッドで行い、結果をチャネルで受け取る
+// ファイル選択ダイアログと読み込みは別スレッドで行い、結果をチャネルで受け取る
 #[derive(Resource, Default)]
 pub struct ImportState {
     receiver: Option<Mutex<Receiver<ImportResult>>>,
@@ -66,6 +95,8 @@ fn poll_import(
     mut layout: ResMut<SceneLayout>,
     mut state: ResMut<EditState>,
     mut library: ResMut<SceneLibrary>,
+    mut store: ResMut<PackageStore>,
+    display: Res<DisplayInfo>,
 ) {
     let Some(receiver) = &import.receiver else {
         return;
@@ -81,17 +112,21 @@ fn poll_import(
         ImportResult::Cancelled => {}
         ImportResult::Imported {
             kind: ImportKind::World,
-            asset_path,
+            source,
+            model,
             name,
         } => {
             // ワールドだけの新しいシーンとして保存して開く。のぞき窓はワールドの peek_window に合わせる
             let name = library::unique_name(&name);
-            let world = SceneLayout::with_world(&asset_path);
-            match library.save_as(&name, &world) {
+            let (world_path, files) = model.placed_in(WORLD_DIR);
+            let mut world = SceneLayout::with_world(&world_path, &source.to_string_lossy());
+            world.reference = Some(display.size);
+            store.replace(files);
+            match library.save_as(&name, &world, &store) {
                 Ok(()) => {
                     layout.replace_with(world);
                     state.scene_switched(&layout);
-                    info!("{} をワールドとして取り込み、シーン「{}」を作りました", asset_path, name);
+                    info!("{} をワールドとして取り込み、シーン「{}」を作りました", source.display(), name);
                 }
                 Err(e) => {
                     warn!("{}", e);
@@ -101,9 +136,16 @@ fn poll_import(
         }
         ImportResult::Imported {
             kind: ImportKind::Model,
-            asset_path,
+            source,
+            model,
             name,
         } => {
+            // シーンの中の models/<名前>/ に入れる
+            let folder = store.unique_folder(MODEL_DIR, &name);
+            let (path, files) = model.placed_in(&folder);
+            for (rel, bytes) in files {
+                store.insert(rel, bytes);
+            }
             // のぞき窓の正面・奥に、床に置く (窓が傾いていても、モデルはまっすぐ立てる)
             let window = &layout.window;
             let facing = Quat::from_rotation_y(window.yaw_deg.to_radians());
@@ -114,13 +156,13 @@ fn poll_import(
                 yaw_deg: window.yaw_deg,
                 ..default()
             };
-            let id = layout.add_object(&name, ObjectKind::Model { path: asset_path.clone() }, placement);
+            let id = layout.add_object(&name, ObjectKind::Model { path }, placement);
             if let Some(object) = layout.object_mut(id) {
                 object.auto_fit = true;
             }
             state.selection = Some(Selection::Object(id));
             state.import_error = None;
-            info!("{} をインポートしました", asset_path);
+            info!("{} をインポートしました", source.display());
         }
         ImportResult::Failed(e) => {
             warn!("インポートに失敗しました: {}", e);
@@ -130,9 +172,9 @@ fn poll_import(
 }
 
 fn run_import(kind: ImportKind) -> ImportResult {
-    let (title, dir) = match kind {
-        ImportKind::Model => ("インポートするモデルを選択", MODEL_DIR),
-        ImportKind::World => ("インポートするワールドを選択", WORLD_DIR),
+    let title = match kind {
+        ImportKind::Model => "インポートするモデルを選択",
+        ImportKind::World => "インポートするワールドを選択",
     };
     let Some(source) = rfd::FileDialog::new()
         .set_title(title)
@@ -141,102 +183,42 @@ fn run_import(kind: ImportKind) -> ImportResult {
     else {
         return ImportResult::Cancelled;
     };
-
-    match copy_into_assets(&source, dir) {
-        Ok((asset_path, name)) => ImportResult::Imported { kind, asset_path, name },
-        Err(e) => ImportResult::Failed(e),
-    }
-}
-
-// Bevy の AssetServer と同じ基準で assets フォルダを決める
-// (BEVY_ASSET_ROOT → CARGO_MANIFEST_DIR → 実行ファイルの場所)
-pub(super) fn assets_dir() -> PathBuf {
-    let base = std::env::var("BEVY_ASSET_ROOT")
-        .or_else(|_| std::env::var("CARGO_MANIFEST_DIR"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(Path::to_path_buf))
-                .unwrap_or_default()
-        });
-    base.join("assets")
-}
-
-// モデルを assets/<dir>/<名前>/ にコピーし、(アセットパス, 名前) を返す。
-// すでに assets フォルダ内にあるファイルはコピーせずにそのまま使う
-pub(super) fn copy_into_assets(source: &Path, dir: &str) -> Result<(String, String), String> {
-    let assets = assets_dir();
     let name = source
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "model".to_string());
-    let file_name = source
+    match read_model_files(&source) {
+        Ok(model) => ImportResult::Imported { kind, source, model, name },
+        Err(e) => ImportResult::Failed(e),
+    }
+}
+
+// モデルのファイルを読み込む。.gltf は .bin やテクスチャを別ファイルで参照しているので、それも読む
+pub fn read_model_files(source: &Path) -> Result<ModelFiles, String> {
+    let main = source
         .file_name()
-        .ok_or_else(|| "ファイル名を取得できませんでした".to_string())?;
+        .ok_or_else(|| "ファイル名を取得できませんでした".to_string())?
+        .to_string_lossy()
+        .into_owned();
+    let read = |path: &Path| std::fs::read(path).map_err(|e| format!("{} を読めませんでした: {}", path.display(), e));
+    let bytes = read(source)?;
+    let mut files = Vec::new();
 
-    if let (Ok(source_abs), Ok(assets_abs)) = (source.canonicalize(), assets.canonicalize()) {
-        if let Ok(relative) = source_abs.strip_prefix(&assets_abs) {
-            return Ok((to_asset_path(relative), name));
-        }
-    }
-
-    let is_gltf = source
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("gltf"));
-
-    // 同名のフォルダがあれば _2, _3 … を付ける
-    let import_root = assets.join(dir);
-    let mut folder = name.clone();
-    let mut n = 2;
-    while import_root.join(&folder).exists() {
-        folder = format!("{}_{}", name, n);
-        n += 1;
-    }
-    let dest_dir = import_root.join(&folder);
-    std::fs::create_dir_all(&dest_dir)
-        .map_err(|e| format!("{} を作成できませんでした: {}", dest_dir.display(), e))?;
-
-    copy_file(source, &dest_dir.join(file_name))?;
-
-    // .gltf は .bin やテクスチャを別ファイルで参照しているので、それも一緒にコピーする
+    let is_gltf = source.extension().is_some_and(|e| e.eq_ignore_ascii_case("gltf"));
     if is_gltf {
-        let text = std::fs::read_to_string(source)
-            .map_err(|e| format!("{} を読めませんでした: {}", source.display(), e))?;
+        let text = String::from_utf8_lossy(&bytes).into_owned();
         let source_dir = source.parent().unwrap_or(Path::new(""));
         for uri in referenced_uris(&text) {
-            let relative = PathBuf::from(&uri);
-            if relative
-                .components()
-                .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
-            {
-                warn!("フォルダの外を参照しているためコピーしません: {}", uri);
+            if !is_inside(&uri) {
+                warn!("フォルダの外を参照しているため読み込みません: {}", uri);
                 continue;
             }
-            let dest = dest_dir.join(&relative);
-            if let Some(parent) = dest.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            copy_file(&source_dir.join(&relative), &dest)?;
+            let uri = uri.replace('\\', "/");
+            files.push((uri.clone(), read(&source_dir.join(&uri))?));
         }
     }
-
-    let asset_path = format!("{}/{}/{}", dir, folder, file_name.to_string_lossy());
-    Ok((asset_path, name))
-}
-
-fn copy_file(from: &Path, to: &Path) -> Result<(), String> {
-    std::fs::copy(from, to)
-        .map(|_| ())
-        .map_err(|e| format!("{} をコピーできませんでした: {}", from.display(), e))
-}
-
-fn to_asset_path(relative: &Path) -> String {
-    relative
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
+    files.insert(0, (main.clone(), bytes));
+    Ok(ModelFiles { main, files })
 }
 
 // .gltf の JSON から "uri": "..." の値を取り出す (埋め込みの data: URI は除く)

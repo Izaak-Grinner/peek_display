@@ -6,3 +6,4 @@ pub mod package;
 pub mod library;
 pub mod world;
 pub mod highlight;
+pub mod package_store;

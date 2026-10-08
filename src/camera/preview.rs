@@ -1,6 +1,6 @@
 use crate::app_mode::AppMode;
 use crate::camera::main_camera::MainDisplayCamera;
-use crate::config::AppConfig;
+use crate::config::DisplayInfo;
 use crate::scene::editor::{EditState, Selection};
 use crate::scene::highlight::SELECTION_COLOR;
 use crate::scene::layout::SceneLayout;
@@ -93,7 +93,7 @@ fn setup_gizmo_layer(mut config_store: ResMut<GizmoConfigStore>) {
 fn draw_grid_and_gizmos(
     mut gizmos: Gizmos,
     mut outline: Gizmos<SelectionOutlineGizmos>,
-    config: Res<AppConfig>,
+    display: Res<DisplayInfo>,
     layout: Res<SceneLayout>,
     mode: Res<State<AppMode>>,
     state: Res<EditState>,
@@ -119,12 +119,18 @@ fn draw_grid_and_gizmos(
         }
     }
 
-    let (screen_width, screen_height) = config.screen_size();
+    // 実際に使う窓 (この画面の大きさ × 縮尺)
     let frame = Isometry3d::new(window_center, layout.window.rotation());
-    let frame_size = Vec2::new(screen_width, screen_height);
+    let frame_size = display.size * display.view_scale(layout.reference);
     gizmos.rect(frame, frame_size, camera_color);
     if selected {
         outline.rect(frame, frame_size, SELECTION_COLOR);
+    }
+    // シーンを作ったときの画面 (基準の画面) が違う大きさなら、灰色で重ねて描く
+    if let Some(reference) = layout.reference {
+        if (reference - frame_size).abs().max_element() > 1e-4 {
+            gizmos.rect(frame, reference, LinearRgba::new(0.6, 0.6, 0.6, 1.0));
+        }
     }
 }
 

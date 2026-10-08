@@ -1,7 +1,11 @@
-use bevy::{camera::Viewport, prelude::*, window::PrimaryWindow};
+use bevy::{
+    camera::Viewport,
+    prelude::*,
+    window::{MonitorSelection, PrimaryWindow, WindowMode},
+};
 
 use crate::camera::{main_camera::MainDisplayCamera, preview::PreviewCamera};
-use crate::config::AppConfig;
+use crate::config::DisplayInfo;
 
 #[derive(States, Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AppMode {
@@ -39,7 +43,14 @@ impl Plugin for AppModePlugin {
                         .run_if(not(in_state(AppMode::Edit)).and(not(in_state(AppMode::Home)))),
                     update_camera_layout,
                 ),
-            );
+            )
+            // 本番モードは全画面にする (映る範囲 = 画面全体にして、実物の大きさと合わせるため)
+            .add_systems(OnEnter(AppMode::Production), |mut window: Single<&mut Window, With<PrimaryWindow>>| {
+                window.mode = WindowMode::BorderlessFullscreen(MonitorSelection::Current);
+            })
+            .add_systems(OnExit(AppMode::Production), |mut window: Single<&mut Window, With<PrimaryWindow>>| {
+                window.mode = WindowMode::Windowed;
+            });
     }
 }
 
@@ -53,7 +64,7 @@ fn return_home_on_esc(keyboard: Res<ButtonInput<KeyCode>>, mut next: ResMut<Next
 // (毎フレーム計算し、変わったときだけ書き込む。ウィンドウのリサイズにも追従する)
 fn update_camera_layout(
     mode: Res<State<AppMode>>,
-    config: Res<AppConfig>,
+    display: Res<DisplayInfo>,
     insets: Res<EditViewInsets>,
     window: Single<&Window, With<PrimaryWindow>>,
     mut preview: Single<&mut Camera, (With<PreviewCamera>, Without<MainDisplayCamera>)>,
@@ -72,11 +83,10 @@ fn update_camera_layout(
             let left = viewport(UVec2::ZERO, UVec2::new(half, size.y));
             // 右半分の中に、ディスプレイと同じ縦横比の領域を中央寄せで取る
             // (半分の幅に引き伸ばすと、非対称視錐台の比率が実物とずれるため)
-            let (screen_width, screen_height) = config.screen_size();
             let right = fit_aspect(
                 UVec2::new(half, 0),
                 UVec2::new(size.x - half, size.y),
-                screen_width / screen_height,
+                display.aspect(),
             );
             (Some(Some(left)), Some(Some(right)))
         }

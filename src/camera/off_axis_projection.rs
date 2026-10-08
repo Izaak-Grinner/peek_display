@@ -7,7 +7,7 @@ use crate::camera::inset::InsetCamera;
 use crate::camera::main_camera::MainDisplayCamera;
 use crate::tracking::tracking::HeadPose;
 
-use crate::config::{AppConfig, OFF_AXIS_FAR, OFF_AXIS_NEAR};
+use crate::config::{AppConfig, DisplayInfo, OFF_AXIS_FAR, OFF_AXIS_NEAR};
 use crate::scene::layout::SceneLayout;
 
 #[derive(Component, Clone, Debug)]
@@ -79,6 +79,7 @@ impl Plugin for OffAxisPlugin {
 fn update_off_axis_projection(
     pose: Res<HeadPose>,
     config: Res<AppConfig>,
+    display: Res<DisplayInfo>,
     layout: Res<SceneLayout>,
     // 編集モードの小窓のカメラも、覗き込みカメラと同じように動かす
     mut query: Query<(&mut Transform, &mut Projection), Or<(With<MainDisplayCamera>, With<InsetCamera>)>>,
@@ -90,22 +91,27 @@ fn update_off_axis_projection(
         let Some(projection) = custom.get_mut::<OffAxisProjection>() else {
             continue;
         };
-        apply_off_axis(&pose, &config, &layout, &mut transform, projection);
+        apply_off_axis(&pose, &config, &display, &layout, &mut transform, projection);
     }
 }
 
 fn apply_off_axis(
     pose: &HeadPose,
     config: &AppConfig,
+    display: &DisplayInfo,
     layout: &SceneLayout,
     transform: &mut Transform,
     projection: &mut OffAxisProjection,
 ) {
-    // OpenTrack(cm) -> m
-    let ex = pose.x * 0.01;
-    let ey = pose.y * 0.01;
+    // 画面の大きさがシーンを作ったときと違えば、基準の画面の範囲が全部入るように縮尺を変える。
+    // 窓の大きさと目の位置を同じ割合で変えるので、頭を動かしても景色は滑らない
+    let k = display.view_scale(layout.reference);
 
-    let ez = (config.viewer_base_distance - pose.z * 0.01).max(config.viewer_min_distance);
+    // OpenTrack(cm) -> m
+    let ex = pose.x * 0.01 * k;
+    let ey = pose.y * 0.01 * k;
+
+    let ez = (config.viewer_base_distance - pose.z * 0.01).max(config.viewer_min_distance) * k;
 
     // 視錐台はディスプレイ基準の座標(ex, ey, ez)で計算し、
     // カメラ自体はのぞき窓の位置・向きに合わせて置く(カメラの向き = 窓の向き)
@@ -114,7 +120,8 @@ fn apply_off_axis(
     *transform = window * Transform::from_xyz(ex, ey, ez);
 
     let n = projection.near;
-    let (screen_width, screen_height) = config.screen_size();
+    let screen_width = display.size.x * k;
+    let screen_height = display.size.y * k;
 
     projection.left = n * (-screen_width * 0.5 - ex) / ez;
 

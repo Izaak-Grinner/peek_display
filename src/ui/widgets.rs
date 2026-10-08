@@ -40,7 +40,6 @@ pub mod color {
     pub const TEXT_UNIT: Color32 = hex(0xa0a0a0);
 
     pub const SELECTED: Color32 = hex(0x2f5597);
-    pub const SELECTED_BORDER: Color32 = hex(0x3f66ab);
     pub const SELECTED_TAG: Color32 = hex(0xdce6f7);
     pub const FOCUS: Color32 = hex(0x4d7fd4);
 
@@ -276,20 +275,6 @@ pub const BUTTON_DANGER_SOLID: ButtonStyle = ButtonStyle {
     text: Color32::WHITE,
     bold: true,
 };
-pub const BUTTON_CHIP: ButtonStyle = ButtonStyle {
-    fill: Color32::TRANSPARENT,
-    hover: hex(0x303030),
-    border: hex(0x414141),
-    text: hex(0xcfcfcf),
-    ..BUTTON
-};
-pub const BUTTON_CHIP_ON: ButtonStyle = ButtonStyle {
-    fill: SELECTED,
-    hover: SELECTED,
-    border: SELECTED_BORDER,
-    text: Color32::WHITE,
-    ..BUTTON
-};
 
 pub struct Button<'a> {
     label: &'a str,
@@ -341,16 +326,6 @@ impl<'a> Button<'a> {
 
     pub fn padding(mut self, padding: f32) -> Self {
         self.padding = padding;
-        self
-    }
-
-    pub fn font_size(mut self, font_size: f32) -> Self {
-        self.font_size = font_size;
-        self
-    }
-
-    pub fn radius(mut self, radius: u8) -> Self {
-        self.radius = radius;
         self
     }
 

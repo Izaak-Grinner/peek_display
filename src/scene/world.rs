@@ -5,7 +5,9 @@ use bevy::{prelude::*, scene::SceneInstanceReady};
 
 use crate::scene::editor::EditState;
 use crate::scene::layout::{Placement, SceneLayout};
+use crate::scene::import::read_model_files;
 use crate::scene::library::SceneLibrary;
+use crate::scene::package_store::PackageStore;
 use crate::scene::scene::{DefaultLight, RoomPart};
 
 // のぞき窓の位置と向きを決めるノードの名前 (Blender のオブジェクト名)
@@ -14,6 +16,7 @@ pub const PEEK_WINDOW_NODE: &str = "peek_window";
 // 表示中のワールド
 #[derive(Resource, Default)]
 pub struct WorldInfo {
+    // 読み込んでいるワールドのパス (peek://<番号>/...)。シーンを開き直すと変わる
     path: Option<String>,
     root: Option<Entity>,
     scene: Option<Handle<Scene>>,
@@ -58,7 +61,7 @@ impl Plugin for WorldPlugin {
             Update,
             (
                 reload_world,
-                sync_world.run_if(resource_changed::<SceneLayout>),
+                sync_world.run_if(resource_changed::<SceneLayout>.or(resource_changed::<PackageStore>)),
                 respawn_modified_world,
                 apply_window_from_world,
                 apply_world_overrides.run_if(resource_changed::<SceneLayout>.or(resource_changed::<WorldInfo>)),
@@ -86,15 +89,16 @@ fn sync_world(
     mut commands: Commands,
     layout: Res<SceneLayout>,
     asset_server: Res<AssetServer>,
+    store: Res<PackageStore>,
     mut info: ResMut<WorldInfo>,
 ) {
-    if info.path == layout.world {
+    let path = layout.world.as_deref().map(|w| store.asset_path(w));
+    if info.path == path {
         return;
     }
     if let Some(root) = info.root.take() {
         commands.entity(root).despawn();
     }
-    let path = layout.world.clone();
     *info = WorldInfo {
         path: path.clone(),
         ..default()
@@ -111,16 +115,35 @@ fn sync_world(
     info.scene = Some(scene);
 }
 
-// Blender で書き出し直したワールドを読み直す
-fn reload_world(mut info: ResMut<WorldInfo>, asset_server: Res<AssetServer>) {
+// Blender で書き出し直したワールドを、元のファイルから読み直してシーンの中身を差し替える
+fn reload_world(
+    mut info: ResMut<WorldInfo>,
+    layout: Res<SceneLayout>,
+    mut store: ResMut<PackageStore>,
+    asset_server: Res<AssetServer>,
+) {
     if !info.reload_requested {
         return;
     }
     info.reload_requested = false;
-    if let Some(path) = &info.path {
-        info!("ワールド {} を再読み込みします", path);
-        asset_server.reload(path.clone());
+    let (Some(path), Some(world), Some(source)) = (&info.path, &layout.world, &layout.world_source) else {
+        return;
+    };
+    let model = match read_model_files(std::path::Path::new(source)) {
+        Ok(model) => model,
+        Err(e) => {
+            warn!("ワールドを再読み込みできませんでした: {}", e);
+            return;
+        }
+    };
+    // シーンの中で、ワールドを置いているフォルダに入れ直す
+    let folder = world.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+    let (_, files) = model.placed_in(folder);
+    for (rel, bytes) in files {
+        store.insert(rel, bytes);
     }
+    info!("ワールドを {} から再読み込みします", source);
+    asset_server.reload(path.clone());
 }
 
 // 読み直しが終わったら、ワールドを出し直してノードを調べ直す
@@ -262,6 +285,7 @@ fn apply_window_from_world(
     mut layout: ResMut<SceneLayout>,
     info: Res<WorldInfo>,
     library: Res<SceneLibrary>,
+    store: Res<PackageStore>,
     mut state: ResMut<EditState>,
 ) {
     if !layout.window_from_world || !info.ready {
@@ -273,7 +297,7 @@ fn apply_window_from_world(
     };
     layout.window = window;
     if library.current.is_some() {
-        match library.save(&layout) {
+        match library.save(&layout, &store) {
             Ok(()) => state.mark_layout_saved(&layout),
             Err(e) => warn!("{}", e),
         }

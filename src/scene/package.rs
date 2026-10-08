@@ -1,29 +1,160 @@
-// 共有用のシーンの書き出し・読み込み。
-// シーンファイルと、シーンが使うワールド・モデルのファイルを1つの .zip にまとめる。
-// zip の中のファイルは assets フォルダと同じ相対パスで入れる (例: worlds/room/room.glb)
+// シーンファイル (.peek)。中身は zip で、scene.ini と、シーンが使うワールド・モデルのファイルを入れる。
+// このファイル1つを渡せば、ほかのPCでも同じシーンが開ける。
+// ファイルはシーンの中の相対パスで入れる (例: world/room.glb、models/izayoi/izayoi_02.glb)
 use bevy::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use crate::scene::editor::EditState;
-use crate::scene::import::{MODEL_DIR, WORLD_DIR, assets_dir, copy_into_assets, referenced_uris};
+use crate::scene::import::referenced_uris;
 use crate::scene::layout::{ObjectKind, SceneLayout};
 use crate::scene::library::{self, SceneLibrary};
+use crate::scene::package_store::PackageStore;
 
-// zip の中のシーンファイル名
+pub const PEEK_EXTENSION: &str = "peek";
+// .peek の中のシーンの設定
 const SCENE_ENTRY: &str = "scene.ini";
+
+// シーンの中の相対パス (区切りは /) → 中身
+pub type PackageFiles = BTreeMap<String, Vec<u8>>;
+
+// ---------------------------------------------------------------- 読み書き
+
+pub fn read_peek(path: &Path) -> Result<(SceneLayout, PackageFiles), String> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("{} を開けませんでした: {}", path.display(), e))?;
+    let mut zip = zip::ZipArchive::new(file)
+        .map_err(|e| format!("{} はシーンファイルとして読めませんでした: {}", path.display(), e))?;
+
+    let mut scene_text = None;
+    let mut files = PackageFiles::new();
+    for i in 0..zip.len() {
+        let mut entry = zip
+            .by_index(i)
+            .map_err(|e| format!("シーンファイルを読めませんでした: {}", e))?;
+        if entry.is_dir() {
+            continue;
+        }
+        // 外 (../ や絶対パス) を指すものは読まない
+        let Some(relative) = entry.enclosed_name() else {
+            warn!("不正なパスのため読みません: {}", entry.name());
+            continue;
+        };
+        let rel = to_rel_path(&relative);
+        let mut bytes = Vec::new();
+        entry
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("{} を読めませんでした: {}", rel, e))?;
+        if rel == SCENE_ENTRY {
+            scene_text = Some(String::from_utf8_lossy(&bytes).into_owned());
+        } else {
+            files.insert(rel, bytes);
+        }
+    }
+    let scene_text = scene_text.ok_or_else(|| format!("{} が入っていません。このアプリのシーンファイル (.peek) を選んでください", SCENE_ENTRY))?;
+    Ok((SceneLayout::parse(&scene_text), files))
+}
+
+// シーンが参照しているファイルだけを書く。一時ファイルに書いてから置き換え、途中で失敗しても元のファイルを壊さない
+pub fn write_peek(path: &Path, layout: &SceneLayout, files: &PackageFiles) -> Result<(), String> {
+    let temp = path.with_extension(format!("{}.tmp", PEEK_EXTENSION));
+    let result = write_zip(&temp, layout, files).and_then(|_| {
+        std::fs::rename(&temp, path).map_err(|e| format!("{} に書き込めませんでした: {}", path.display(), e))
+    });
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+fn write_zip(path: &Path, layout: &SceneLayout, files: &PackageFiles) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let file = std::fs::File::create(path)
+        .map_err(|e| format!("{} を作成できませんでした: {}", path.display(), e))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    let zip_err = |e: zip::result::ZipError| format!("シーンファイルを書き込めませんでした: {}", e);
+    let io_err = |e: std::io::Error| format!("シーンファイルを書き込めませんでした: {}", e);
+
+    zip.start_file(SCENE_ENTRY, options).map_err(zip_err)?;
+    zip.write_all(layout.to_ini().as_bytes()).map_err(io_err)?;
+
+    let mut entries = BTreeSet::new();
+    for path in used_files(layout) {
+        entries.extend(model_files(files, path)?);
+    }
+    for entry in entries {
+        let bytes = files
+            .get(&entry)
+            .ok_or_else(|| format!("{} がシーンの中にありません", entry))?;
+        zip.start_file(entry.as_str(), options).map_err(zip_err)?;
+        zip.write_all(bytes).map_err(io_err)?;
+    }
+    zip.finish().map_err(zip_err)?;
+    Ok(())
+}
+
+// シーンが使うワールドとモデルのパス
+fn used_files(layout: &SceneLayout) -> impl Iterator<Item = &String> {
+    layout.world.iter().chain(layout.objects.iter().filter_map(|o| match &o.kind {
+        ObjectKind::Model { path } => Some(path),
+        ObjectKind::Cube { .. } => None,
+    }))
+}
+
+// モデルが使うファイルの一覧。.gltf は .bin やテクスチャを別ファイルで参照しているので、それも含める
+fn model_files(files: &PackageFiles, path: &str) -> Result<Vec<String>, String> {
+    let mut list = vec![path.to_string()];
+    if !path.to_ascii_lowercase().ends_with(".gltf") {
+        return Ok(list);
+    }
+    let bytes = files
+        .get(path)
+        .ok_or_else(|| format!("{} がシーンの中にありません", path))?;
+    let text = String::from_utf8_lossy(bytes);
+    let dir = path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+    for uri in referenced_uris(&text) {
+        if !is_inside(&uri) {
+            warn!("フォルダの外を参照しているため含めません: {}", uri);
+            continue;
+        }
+        let uri = uri.replace('\\', "/");
+        list.push(if dir.is_empty() { uri } else { format!("{}/{}", dir, uri) });
+    }
+    Ok(list)
+}
+
+// 相対パスが、そのフォルダの中だけを指しているか
+pub(super) fn is_inside(path: &str) -> bool {
+    Path::new(path)
+        .components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+}
+
+fn to_rel_path(path: &Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+// ---------------------------------------------------------------- エクスポート・インポート
 
 enum PackageResult {
     Cancelled,
     Exported(String),
-    Imported { layout: SceneLayout, file_name: String },
+    // scenes フォルダにコピーしたシーンの名前
+    Imported(String),
     Failed(String),
 }
 
-// 最後に行った書き出し・読み込みの結果 (パネルに表示する)
+// 最後に行ったエクスポート・インポートの結果 (パネルに表示する)
 #[derive(Clone, Debug)]
 pub enum PackageMessage {
     Exported(String),
@@ -31,7 +162,7 @@ pub enum PackageMessage {
     Failed(String),
 }
 
-// ファイル選択ダイアログと zip の読み書きは別スレッドで行い、結果をチャネルで受け取る
+// ファイル選択ダイアログとファイルの読み書きは別スレッドで行い、結果をチャネルで受け取る
 #[derive(Resource, Default)]
 pub struct PackageState {
     receiver: Option<Mutex<Receiver<PackageResult>>>,
@@ -43,12 +174,15 @@ impl PackageState {
         self.receiver.is_some()
     }
 
-    // 今のシーン (保存していない変更も含む) を書き出す
-    pub fn start_export(&mut self, layout: &SceneLayout) {
+    // 今のシーン (保存していない変更も含む) を、選んだ場所に書き出す
+    pub fn start_export(&mut self, layout: &SceneLayout, files: &PackageFiles, name: &str) {
         let layout = layout.clone();
-        self.start(move || run_export(&layout));
+        let files = files.clone();
+        let file_name = format!("{}.{}", name, PEEK_EXTENSION);
+        self.start(move || run_export(&layout, &files, &file_name));
     }
 
+    // 選んだ .peek を scenes フォルダにコピーする (開くのは poll_package)
     pub fn start_import(&mut self) {
         self.start(run_import);
     }
@@ -80,6 +214,7 @@ fn poll_package(
     mut layout: ResMut<SceneLayout>,
     mut state: ResMut<EditState>,
     mut library: ResMut<SceneLibrary>,
+    mut store: ResMut<PackageStore>,
 ) {
     let Some(receiver) = &package.receiver else {
         return;
@@ -94,236 +229,62 @@ fn poll_package(
     package.message = match result {
         PackageResult::Cancelled => None,
         PackageResult::Exported(file_name) => {
-            info!("シーンを {} に書き出しました", file_name);
+            info!("シーンを {} にエクスポートしました", file_name);
             Some(PackageMessage::Exported(file_name))
         }
-        PackageResult::Imported { layout: loaded, file_name } => {
-            // zip の名前でシーンとして保存して開く。保存できなければ名前の無いシーンとして開く
-            let stem = Path::new(&file_name)
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let name = library::unique_name(&stem);
-            if let Err(e) = library.save_as(&name, &loaded) {
-                warn!("{}", e);
-                *library = SceneLibrary::untitled(&name);
+        PackageResult::Imported(name) => match library.open_scene(&name, &mut store) {
+            Ok(loaded) => {
+                layout.replace_with(loaded);
+                state.scene_switched(&layout);
+                info!("シーン「{}」をインポートしました", name);
+                Some(PackageMessage::Imported(name))
             }
-            layout.replace_with(loaded);
-            state.scene_switched(&layout);
-            info!("シーンを {} から読み込みました", file_name);
-            Some(PackageMessage::Imported(name))
-        }
+            Err(e) => Some(PackageMessage::Failed(e)),
+        },
         PackageResult::Failed(e) => {
-            warn!("シーンの書き出し・読み込みに失敗しました: {}", e);
+            warn!("シーンのエクスポート・インポートに失敗しました: {}", e);
             Some(PackageMessage::Failed(e))
         }
     };
 }
 
-// ---------------------------------------------------------------- 書き出し
-
-fn run_export(layout: &SceneLayout) -> PackageResult {
+fn run_export(layout: &SceneLayout, files: &PackageFiles, file_name: &str) -> PackageResult {
     let Some(dest) = rfd::FileDialog::new()
-        .set_title("シーンを書き出す")
-        .add_filter("シーン (.zip)", &["zip"])
-        .set_file_name("scene.zip")
+        .set_title("シーンをエクスポート")
+        .add_filter("シーン (.peek)", &[PEEK_EXTENSION])
+        .set_file_name(file_name)
         .save_file()
     else {
         return PackageResult::Cancelled;
     };
-    let file_name = display_name(&dest);
-    match write_package(layout, &dest) {
-        Ok(()) => PackageResult::Exported(file_name),
-        Err(e) => {
-            // 書きかけのファイルを残さない
-            let _ = std::fs::remove_file(&dest);
-            PackageResult::Failed(e)
-        }
-    }
-}
-
-fn write_package(layout: &SceneLayout, dest: &Path) -> Result<(), String> {
-    let assets = assets_dir();
-    let file = std::fs::File::create(dest)
-        .map_err(|e| format!("{} を作成できませんでした: {}", dest.display(), e))?;
-    let mut zip = zip::ZipWriter::new(file);
-    let options = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
-    let zip_err = |e: zip::result::ZipError| format!("zip を書き込めませんでした: {}", e);
-
-    zip.start_file(SCENE_ENTRY, options).map_err(zip_err)?;
-    zip.write_all(layout.to_ini().as_bytes())
-        .map_err(|e| format!("zip を書き込めませんでした: {}", e))?;
-
-    let mut written = HashSet::new();
-    for path in used_files(layout) {
-        for entry in model_files(&assets, path)? {
-            if !written.insert(entry.clone()) {
-                continue;
-            }
-            let bytes = std::fs::read(assets.join(&entry))
-                .map_err(|e| format!("{} を読めませんでした: {}", entry, e))?;
-            zip.start_file(entry.as_str(), options).map_err(zip_err)?;
-            zip.write_all(&bytes)
-                .map_err(|e| format!("zip を書き込めませんでした: {}", e))?;
-        }
-    }
-    zip.finish().map_err(zip_err)?;
-    Ok(())
-}
-
-// シーンが使うワールドとモデルのアセットパス
-fn used_files(layout: &SceneLayout) -> impl Iterator<Item = &String> {
-    layout.world.iter().chain(layout.objects.iter().filter_map(|o| match &o.kind {
-        ObjectKind::Model { path } => Some(path),
-        ObjectKind::Cube { .. } => None,
-    }))
-}
-
-// モデルが使うファイルの一覧 (base からの相対パス)。
-// .gltf は .bin やテクスチャを別ファイルで参照しているので、それも含める
-fn model_files(base: &Path, path: &str) -> Result<Vec<String>, String> {
-    let mut files = vec![path.to_string()];
-    if !path.to_ascii_lowercase().ends_with(".gltf") {
-        return Ok(files);
-    }
-    let text = std::fs::read_to_string(base.join(path))
-        .map_err(|e| format!("{} を読めませんでした: {}", path, e))?;
-    let dir = path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
-    for uri in referenced_uris(&text) {
-        if Path::new(&uri)
-            .components()
-            .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
-        {
-            warn!("フォルダの外を参照しているため含めません: {}", uri);
-            continue;
-        }
-        let uri = uri.replace('\\', "/");
-        files.push(if dir.is_empty() { uri } else { format!("{}/{}", dir, uri) });
-    }
-    Ok(files)
-}
-
-// ---------------------------------------------------------------- 読み込み
-
-fn run_import() -> PackageResult {
-    let Some(source) = rfd::FileDialog::new()
-        .set_title("シーンを読み込む")
-        .add_filter("シーン (.zip)", &["zip"])
-        .pick_file()
-    else {
-        return PackageResult::Cancelled;
-    };
-
-    // 一時フォルダに展開してから、モデルを assets フォルダへコピーする
-    let temp = std::env::temp_dir().join(format!(
-        "peek_display_scene_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    let result = read_package(&source, &temp);
-    let _ = std::fs::remove_dir_all(&temp);
-    match result {
-        Ok(layout) => PackageResult::Imported {
-            layout,
-            file_name: display_name(&source),
-        },
+    match write_peek(&dest, layout, files) {
+        Ok(()) => PackageResult::Exported(display_name(&dest)),
         Err(e) => PackageResult::Failed(e),
     }
 }
 
-fn read_package(source: &Path, temp: &Path) -> Result<SceneLayout, String> {
-    let file = std::fs::File::open(source)
-        .map_err(|e| format!("{} を開けませんでした: {}", source.display(), e))?;
-    let mut zip = zip::ZipArchive::new(file)
-        .map_err(|e| format!("zip として読めませんでした: {}", e))?;
-
-    let mut scene_text = None;
-    for i in 0..zip.len() {
-        let mut entry = zip
-            .by_index(i)
-            .map_err(|e| format!("zip を読めませんでした: {}", e))?;
-        if entry.is_dir() {
-            continue;
-        }
-        // zip の外 (../ や絶対パス) を指すものは展開しない
-        let Some(relative) = entry.enclosed_name() else {
-            warn!("不正なパスのため展開しません: {}", entry.name());
-            continue;
-        };
-        if relative == Path::new(SCENE_ENTRY) {
-            let mut text = String::new();
-            entry
-                .read_to_string(&mut text)
-                .map_err(|e| format!("{} を読めませんでした: {}", SCENE_ENTRY, e))?;
-            scene_text = Some(text);
-            continue;
-        }
-        let dest = temp.join(&relative);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("{} を作成できませんでした: {}", parent.display(), e))?;
-        }
-        let mut out = std::fs::File::create(&dest)
-            .map_err(|e| format!("{} を作成できませんでした: {}", dest.display(), e))?;
-        std::io::copy(&mut entry, &mut out)
-            .map_err(|e| format!("{} を展開できませんでした: {}", relative.display(), e))?;
-    }
-    let scene_text = scene_text
-        .ok_or_else(|| format!("{} が入っていません。このアプリで書き出したシーンの zip を選んでください", SCENE_ENTRY))?;
-
-    let mut layout = SceneLayout::parse(&scene_text);
-    let assets = assets_dir();
-    if let Some(world) = &mut layout.world {
-        *world = place_model(&assets, temp, world, WORLD_DIR)?;
-    }
-    // 同じモデルを使うオブジェクトが複数あっても、コピーは1回にする
-    let mut resolved: HashMap<String, String> = HashMap::new();
-    for object in &mut layout.objects {
-        let ObjectKind::Model { path } = &mut object.kind else {
-            continue;
-        };
-        if let Some(new_path) = resolved.get(path.as_str()) {
-            *path = new_path.clone();
-            continue;
-        }
-        let new_path = place_model(&assets, temp, path, MODEL_DIR)?;
-        resolved.insert(path.clone(), new_path.clone());
-        *path = new_path;
-    }
-    Ok(layout)
-}
-
-// 展開したモデル (またはワールド) を assets/<dir>/ に置き、使うアセットパスを返す。
-// 同じパスに同じ中身のファイルがすでにあれば、コピーせずにそれを使う
-fn place_model(assets: &Path, temp: &Path, path: &str, dir: &str) -> Result<String, String> {
-    let packed = temp.join(path);
-    let existing = assets.join(path);
-    if !packed.is_file() {
-        // zip に入っていなくても、このPCに同じモデルがあればそれを使う
-        if existing.is_file() {
-            return Ok(path.to_string());
-        }
-        return Err(format!("モデル {} が zip に入っていません", path));
-    }
-    if same_files(temp, assets, path) {
-        return Ok(path.to_string());
-    }
-    copy_into_assets(&packed, dir).map(|(asset_path, _)| asset_path)
-}
-
-// モデルとその参照ファイルが、a と b で同じ中身か
-fn same_files(a: &Path, b: &Path, path: &str) -> bool {
-    let Ok(files) = model_files(a, path) else {
-        return false;
+fn run_import() -> PackageResult {
+    let Some(source) = rfd::FileDialog::new()
+        .set_title("シーンをインポート")
+        .add_filter("シーン (.peek)", &[PEEK_EXTENSION])
+        .pick_file()
+    else {
+        return PackageResult::Cancelled;
     };
-    files.iter().all(|f| match (std::fs::read(a.join(f)), std::fs::read(b.join(f))) {
-        (Ok(x), Ok(y)) => x == y,
-        _ => false,
-    })
+    // 読めるファイルか先に確かめてから、scenes フォルダにコピーする
+    if let Err(e) = read_peek(&source) {
+        return PackageResult::Failed(e);
+    }
+    let stem = source
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let name = library::unique_name(&stem);
+    let dest: PathBuf = library::scene_path(&name);
+    match std::fs::copy(&source, &dest) {
+        Ok(_) => PackageResult::Imported(name),
+        Err(e) => PackageResult::Failed(format!("{} をコピーできませんでした: {}", source.display(), e)),
+    }
 }
 
 fn display_name(path: &Path) -> String {
@@ -337,31 +298,40 @@ mod tests {
     use super::*;
     use crate::scene::layout::Placement;
 
-    // 書き出した zip を読み込むと、同じシーンに戻る (モデルは assets にあるものを使い、コピーしない)
+    // 書き出した .peek を読み直すと、同じシーンと同じファイルに戻る。参照していないファイルは書かない
     #[test]
-    fn export_then_import_round_trip() {
+    fn write_then_read_round_trip() {
         let mut layout = SceneLayout::default();
-        // ワールドとノードの変更も含める (ワールドには assets にある glb を使う)
-        layout.world = Some("models/test/ke1.glb".to_string());
+        layout.world = Some("world/room.gltf".to_string());
+        layout.world_source = Some(r"C:\blender\room.gltf".to_string());
         layout.world_override_mut("Cube").hidden = true;
-        // ライトの設定も含める
-        layout.light.illuminance = 1234.0;
-        layout.light.ambient = 20.0;
-        layout.light.pitch_deg = -30.0;
-        layout.light.yaw_deg = 45.0;
         layout.world_override_mut("Light").placement = Some(Placement {
             position: Vec3::new(0.1, 0.2, 0.3),
             yaw_deg: 30.0,
             scale: 2.0,
             ..default()
         });
+        layout.reference = Some(Vec2::new(0.3446, 0.2154));
+        layout.light.illuminance = 1234.0;
+        layout.light.ambient = 20.0;
+        layout.light.pitch_deg = -30.0;
+        layout.light.yaw_deg = 45.0;
+
+        let mut files = PackageFiles::new();
+        files.insert("world/room.gltf".into(), br#"{"buffers":[{"uri":"room.bin"}]}"#.to_vec());
+        files.insert("world/room.bin".into(), vec![1, 2, 3]);
+        files.insert("models/izayoi/izayoi_02.glb".into(), vec![4, 5, 6]);
+        files.insert("models/unused/unused.glb".into(), vec![7]);
+
         let dir = std::env::temp_dir().join(format!("peek_display_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let zip_path = dir.join("scene.zip");
-        write_package(&layout, &zip_path).unwrap();
-
-        let loaded = read_package(&zip_path, &dir.join("extract")).unwrap();
+        let path = dir.join("scene.peek");
+        write_peek(&path, &layout, &files).unwrap();
+        let (loaded, loaded_files) = read_peek(&path).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+
         assert!(layout.same_content(&loaded));
+        files.remove("models/unused/unused.glb");
+        assert_eq!(files, loaded_files);
     }
 }

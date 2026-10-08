@@ -136,10 +136,14 @@ pub struct WorldOverride {
 // のぞき窓(ディスプレイ面)とオブジェクトの配置。scenes/<名前>.ini に保存する (library.rs)
 #[derive(Resource, Clone, Debug, PartialEq)]
 pub struct SceneLayout {
-    // Blender などで作ったワールド (assets フォルダからの相対パス)
+    // Blender などで作ったワールド (シーンの中の相対パス)
     pub world: Option<String>,
+    // ワールドの元のファイルの場所 (「ワールドを再読み込み」で読み直す。無いPCでは使えない)
+    pub world_source: Option<String>,
     // のぞき窓の中心と向き (scale は使わない)
     pub window: Placement,
+    // シーンを作ったときの画面の幅と高さ (m)。ほかの大きさの画面では、この範囲が全部入るように縮尺を変える
+    pub reference: Option<Vec2>,
     pub light: LightSettings,
     pub world_overrides: Vec<WorldOverride>,
     pub objects: Vec<SceneObject>,
@@ -183,7 +187,9 @@ impl SceneLayout {
     pub fn empty() -> Self {
         Self {
             world: None,
+            world_source: None,
             window: Placement::default(),
+            reference: None,
             light: LightSettings::default(),
             world_overrides: Vec::new(),
             objects: Vec::new(),
@@ -193,9 +199,10 @@ impl SceneLayout {
     }
 
     // ワールドだけのシーン。のぞき窓はワールドの peek_window に合わせる
-    pub fn with_world(path: &str) -> Self {
+    pub fn with_world(path: &str, source: &str) -> Self {
         Self {
             world: Some(path.to_string()),
+            world_source: Some(source.to_string()),
             window_from_world: true,
             ..Self::empty()
         }
@@ -247,7 +254,9 @@ impl SceneLayout {
     // 保存される内容(id 以外)が同じか
     pub fn same_content(&self, other: &Self) -> bool {
         self.world == other.world
+            && self.world_source == other.world_source
             && self.window == other.window
+            && self.reference == other.reference
             && self.light == other.light
             && self.world_overrides == other.world_overrides
             && self.objects.len() == other.objects.len()
@@ -272,7 +281,9 @@ impl SceneLayout {
             self.next_id += 1;
         }
         self.world = other.world;
+        self.world_source = other.world_source;
         self.window = other.window;
+        self.reference = other.reference;
         self.light = other.light;
         self.world_overrides = other.world_overrides;
         self.objects = other.objects;
@@ -284,6 +295,7 @@ impl SceneLayout {
         enum Section {
             World,
             Window,
+            Reference,
             Light,
             WorldNode(usize),
             Object(u64),
@@ -303,6 +315,7 @@ impl SceneLayout {
                     "world" => Section::World,
                     "window" => Section::Window,
                     "light" => Section::Light,
+                    "reference" => Section::Reference,
                     "world_node" => {
                         layout.world_overrides.push(WorldOverride {
                             node: String::new(),
@@ -344,11 +357,20 @@ impl SceneLayout {
                 Section::Unknown => {}
                 Section::World => match key {
                     "path" => layout.world = Some(value.to_string()).filter(|p| !p.is_empty()),
+                    "source" => layout.world_source = Some(value.to_string()).filter(|p| !p.is_empty()),
                     _ => warn!("{}: 不明な設定項目を無視しました: {}", SCENE_FILE_NAME, key),
                 },
                 Section::Window => {
                     if !parse_placement(&mut layout.window, key, value, false) {
                         warn!("{}: 不明な設定項目を無視しました: {}", SCENE_FILE_NAME, key);
+                    }
+                }
+                Section::Reference => {
+                    let size = layout.reference.get_or_insert(Vec2::ZERO);
+                    match key {
+                        "width" => size.x = parse_or_warn(SCENE_FILE_NAME, key, value, size.x),
+                        "height" => size.y = parse_or_warn(SCENE_FILE_NAME, key, value, size.y),
+                        _ => warn!("{}: 不明な設定項目を無視しました: {}", SCENE_FILE_NAME, key),
                     }
                 }
                 Section::Light => {
@@ -418,15 +440,26 @@ impl SceneLayout {
 
         if let Some(world) = &self.world {
             let _ = writeln!(text);
-            let _ = writeln!(text, "# Blender などで作ったワールド (assets フォルダからの相対パス)");
+            let _ = writeln!(text, "# Blender などで作ったワールド (path = シーンの中の相対パス、source = 元のファイルの場所)");
             let _ = writeln!(text, "[world]");
             let _ = writeln!(text, "path={}", world);
+            if let Some(source) = &self.world_source {
+                let _ = writeln!(text, "source={}", source);
+            }
         }
 
         let _ = writeln!(text);
         let _ = writeln!(text, "# のぞき窓 = ディスプレイ面の中心と向き");
         let _ = writeln!(text, "[window]");
         write_placement(&mut text, &self.window, false);
+
+        if let Some(size) = self.reference {
+            let _ = writeln!(text);
+            let _ = writeln!(text, "# シーンを作ったときの画面の幅と高さ(m)。ほかの大きさの画面では、この範囲が全部入るように縮尺を変える");
+            let _ = writeln!(text, "[reference]");
+            let _ = writeln!(text, "width={}", size.x);
+            let _ = writeln!(text, "height={}", size.y);
+        }
 
         let _ = writeln!(text);
         let _ = writeln!(text, "# 照明。illuminance = 太陽光の明るさ(ルクス)、ambient = 環境光の明るさ、pitch/yaw = 太陽光の向き(度)");

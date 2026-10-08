@@ -7,12 +7,13 @@ use bevy_egui::{
 use super::widgets::{self, Button, Icon, NumberField, color::*};
 use crate::app_mode::{AppMode, EditViewInsets};
 use crate::camera::inset::MainCameraInset;
-use crate::config::AppConfig;
+use crate::config::{ARUCO_MARKER_SIZE_CM, AppConfig, DisplayInfo};
 use crate::scene::editor::{EditState, Pending, SaveAsDialog, SaveStatus, Selection};
 use crate::scene::import::{ImportKind, ImportState};
 use crate::scene::layout::{ObjectKind, Placement, SceneLayout, SceneObject};
 use crate::scene::library::{self, SceneLibrary};
-use crate::scene::package::{PackageMessage, PackageState};
+use crate::scene::package::{PackageFiles, PackageMessage, PackageState};
+use crate::scene::package_store::PackageStore;
 use crate::scene::world::{self, WorldInfo, WorldNodeInfo};
 
 const PANEL_WIDTH: f32 = 330.0;
@@ -29,9 +30,6 @@ const INSET_MARGIN: f32 = 12.0;
 
 // 複製したオブジェクトをずらす量(メートル)
 const DUPLICATE_OFFSET: Vec3 = Vec3::new(0.05, 0.0, 0.0);
-
-// よく使うアスペクト比
-const ASPECT_PRESETS: [(f32, f32); 3] = [(16.0, 9.0), (16.0, 10.0), (3.0, 2.0)];
 
 // 編集モードの操作方法。メニューの「ヘルプ → 操作方法」にまとめて出す
 const HELP_ROWS: [(&str, &str); 19] = [
@@ -61,6 +59,7 @@ const HELP_ROWS: [(&str, &str); 19] = [
 pub struct PanelUi {
     screen_closed: bool,
     eye_closed: bool,
+    tracking_closed: bool,
     help_open: bool,
 }
 
@@ -89,6 +88,8 @@ enum Action {
     ResetWindow,
     // ライトを初期値に戻す
     ResetLight,
+    // 今の画面を、シーンの基準の画面にする
+    SetReference,
     // 保存してあるシーンの削除 (確認ダイアログを出す → 削除する / やめる)
     AskDeleteScene(String),
     DeleteScene(String),
@@ -108,7 +109,9 @@ pub fn edit_panel(
     mut library: ResMut<SceneLibrary>,
     mut import: ResMut<ImportState>,
     mut package: ResMut<PackageState>,
+    mut store: ResMut<PackageStore>,
     mut world: ResMut<WorldInfo>,
+    display: Res<DisplayInfo>,
     mut insets: ResMut<EditViewInsets>,
     mut next: ResMut<NextState<AppMode>>,
     mut panel: Local<PanelUi>,
@@ -166,7 +169,7 @@ pub fn edit_panel(
                                 scene_section(ui, layout, state, &import, &package, &world, &mut action);
                                 ui.add_space(4.0);
                                 widgets::section_header(ui, "プロパティ", None, |_| {});
-                                properties(ui, layout, config, state, &world, &mut *panel, &mut action);
+                                properties(ui, layout, config, state, &world, &display, &mut *panel, &mut action);
                             });
                     });
             });
@@ -176,7 +179,7 @@ pub fn edit_panel(
         insets.right = rect.width();
         insets.top = menu_rect.height();
 
-        viewport_overlay(ctx, &mut inset, inset_texture, config.screen_size(), &insets);
+        viewport_overlay(ctx, &mut inset, inset_texture, (display.size.x, display.size.y), &insets);
         help_window(ctx, &mut panel.help_open);
 
         if let Some(id) = state.confirm_delete {
@@ -252,6 +255,8 @@ pub fn edit_panel(
             state,
             library,
             package: &mut package,
+            store: &mut store,
+            display: *display,
             import: &mut import,
             next: &mut next,
         };
@@ -271,12 +276,15 @@ pub fn edit_panel(
             }
             Some(Action::DiscardAndContinue) => {
                 if let Some(pending) = files.state.confirm_discard.take() {
-                    files.state.discard(files.layout, files.config, files.library);
+                    files.state.discard(files.layout, files.config, files.library, files.store);
                     files.run(pending);
                 }
             }
             Some(Action::CancelDiscard) => files.state.confirm_discard = None,
-            Some(Action::ExportScene) => files.package.start_export(files.layout),
+            Some(Action::ExportScene) => {
+                let name = files.library.current.clone().unwrap_or_else(|| files.library.suggested_name.clone());
+                files.package.start_export(files.layout, files.store.files(), &name);
+            }
             Some(Action::ImportModel) => {
                 files.state.import_error = None;
                 files.import.start(ImportKind::Model);
@@ -293,6 +301,7 @@ pub fn edit_panel(
                 files.layout.prune_world_overrides();
             }
             Some(Action::ResetLight) => files.layout.light = Default::default(),
+            Some(Action::SetReference) => files.layout.reference = Some(files.display.size),
             Some(Action::AskDeleteScene(name)) => files.state.confirm_delete_scene = Some(name),
             Some(Action::DeleteScene(name)) => files.delete_scene(&name),
             Some(Action::CancelDeleteScene) => files.state.confirm_delete_scene = None,
@@ -348,6 +357,8 @@ struct FileContext<'a> {
     state: &'a mut EditState,
     library: &'a mut SceneLibrary,
     package: &'a mut PackageState,
+    store: &'a mut PackageStore,
+    display: DisplayInfo,
     import: &'a mut ImportState,
     next: &'a mut NextState<AppMode>,
 }
@@ -367,10 +378,12 @@ impl FileContext<'_> {
             Pending::Exit => self.next.set(AppMode::Home),
             Pending::New => {
                 self.layout.replace_with(SceneLayout::empty());
+                self.layout.reference = Some(self.display.size);
+                self.store.replace(PackageFiles::new());
                 *self.library = SceneLibrary::untitled(NEW_SCENE_NAME);
                 self.state.scene_switched(self.layout);
             }
-            Pending::Open(name) => match self.library.open_scene(&name) {
+            Pending::Open(name) => match self.library.open_scene(&name, self.store) {
                 Ok(loaded) => {
                     self.layout.replace_with(loaded);
                     self.state.scene_switched(self.layout);
@@ -409,6 +422,7 @@ impl FileContext<'_> {
     // 上書き保存する。名前の無いシーンは「名前を付けて保存」にする。
     // then: 保存できたら続けて行う操作
     fn save(&mut self, then: Option<Pending>) {
+        self.ensure_reference();
         if self.library.current.is_none() {
             self.state.save_as = Some(SaveAsDialog {
                 name: self.library.suggested_name.clone(),
@@ -417,19 +431,27 @@ impl FileContext<'_> {
             });
             return;
         }
-        if self.state.save(self.layout, self.config, self.library) {
+        if self.state.save(self.layout, self.config, self.library, self.store) {
             if let Some(pending) = then {
                 self.run(pending);
             }
         }
     }
 
+    // 基準の画面がまだ無いシーンは、保存するときに今の画面を基準にする
+    fn ensure_reference(&mut self) {
+        if self.layout.reference.is_none() {
+            self.layout.reference = Some(self.display.size);
+        }
+    }
+
     fn confirm_save_as(&mut self) {
+        self.ensure_reference();
         let Some(dialog) = &self.state.save_as else {
             return;
         };
         let name = dialog.name.clone();
-        if self.state.save_as(&name, self.layout, self.config, self.library) {
+        if self.state.save_as(&name, self.layout, self.config, self.library, self.store) {
             if let Some(pending) = self.state.save_as.take().and_then(|d| d.then) {
                 self.run(pending);
             }
@@ -531,7 +553,7 @@ fn menu_bar(
                 if ui.add_enabled(!import.busy(), egui::Button::new("ワールド (.glb)…")).clicked() {
                     set(Action::Request(Pending::ImportWorld));
                 }
-                if ui.add_enabled(!package.busy(), egui::Button::new("シーン (.zip)…")).clicked() {
+                if ui.add_enabled(!package.busy(), egui::Button::new("シーン (.peek)…")).clicked() {
                     set(Action::Request(Pending::ImportScene));
                 }
                 if ui.add_enabled(!import.busy(), egui::Button::new("モデル (.glb / .gltf)…")).clicked() {
@@ -540,11 +562,13 @@ fn menu_bar(
             });
             ui.menu_button("エクスポート", |ui| {
                 ui.set_min_width(200.0);
-                if ui.add_enabled(!package.busy(), egui::Button::new("シーン (.zip)…")).clicked() {
+                if ui.add_enabled(!package.busy(), egui::Button::new("シーン (.peek)…")).clicked() {
                     set(Action::ExportScene);
                 }
             });
-            if ui.add_enabled(layout.world.is_some(), egui::Button::new("ワールドを再読み込み")).clicked() {
+            // 元のファイルの場所が分かるワールドだけ (共有を受けたシーンなどでは押せない)
+            let can_reload = layout.world.is_some() && layout.world_source.as_deref().is_some_and(|s| std::path::Path::new(s).is_file());
+            if ui.add_enabled(can_reload, egui::Button::new("ワールドを再読み込み")).clicked() {
                 set(Action::ReloadWorld);
             }
         });
@@ -782,7 +806,7 @@ fn package_status(ui: &mut Ui, package: &PackageState) {
             Color32::from_rgb(0x7f, 0xa8, 0xec),
             Color32::from_rgb(0x1f, 0x26, 0x33),
             "ファイルを選択中…".to_string(),
-            "シーンとモデルを .zip にまとめてエクスポート・インポートします".to_string(),
+            "シーン (.peek) をエクスポート・インポートします".to_string(),
         )
     } else {
         match &package.message {
@@ -798,7 +822,7 @@ fn package_status(ui: &mut Ui, package: &PackageState) {
                 Color32::from_rgb(0x8f, 0xd4, 0x9a),
                 Color32::from_rgb(0x1d, 0x2b, 0x21),
                 format!("シーン「{}」としてインポートしました", file),
-                format!("zip の中身をシーン「{}」として保存し、開きました", file),
+                format!("シーン「{}」として scenes フォルダにコピーし、開きました", file),
             ),
             Some(PackageMessage::Failed(e)) => (
                 Icon::Warning,
@@ -924,13 +948,14 @@ fn properties(
     config: &mut AppConfig,
     state: &mut EditState,
     world: &WorldInfo,
+    display: &DisplayInfo,
     panel: &mut PanelUi,
     action: &mut Option<Action>,
 ) {
     egui::Frame::new().inner_margin(10).show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 10.0;
         match state.selection.clone() {
-            Some(Selection::Window) => window_properties(ui, layout, config, world, panel, action),
+            Some(Selection::Window) => window_properties(ui, layout, config, world, display, panel, action),
             Some(Selection::Light) => light_properties(ui, layout, world, action),
             Some(Selection::WorldNode(name)) => match world.node(&name) {
                 Some(node) => world_node_properties(ui, layout, world, node, action),
@@ -1087,7 +1112,7 @@ fn world_node_properties(
 fn object_properties(ui: &mut Ui, object: &mut SceneObject, action: &mut Option<Action>) {
     let (icon, icon_color) = kind_icon(&object.kind);
     let detail = match &object.kind {
-        ObjectKind::Model { path } => Some(format!("assets/{}", path)),
+        ObjectKind::Model { path } => Some(path.clone()),
         ObjectKind::Cube { .. } => None,
     };
     identity(ui, icon, icon_color, |ui| {
@@ -1252,6 +1277,7 @@ fn window_properties(
     layout: &mut SceneLayout,
     config: &mut AppConfig,
     world: &WorldInfo,
+    display: &DisplayInfo,
     panel: &mut PanelUi,
     action: &mut Option<Action>,
 ) {
@@ -1283,16 +1309,60 @@ fn window_properties(
         }
     }
 
-    // 画面サイズ
+    // 基準の画面 (シーンに保存する)。ほかの大きさの画面では、この範囲が全部入るように縮尺を変える
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing = vec2(GAP, 6.0);
+        widgets::sub_header(ui, "基準の画面（シーン）");
+        let value = match layout.reference {
+            Some(r) => format!("幅 {:.3} m × 高さ {:.3} m", r.x, r.y),
+            None => "未設定（保存すると今の画面になる）".to_string(),
+        };
+        info_row(ui, "基準", &value);
+        let k = display.view_scale(layout.reference);
+        if (k - 1.0).abs() > 1e-3 {
+            widgets::wrapped_label(
+                ui,
+                &format!(
+                    "この画面は基準と大きさが違うので、作ったときの {:.2} 倍の大きさで見えます（俯瞰ビューの灰色の枠が基準の画面）。",
+                    1.0 / k
+                ),
+                10.5,
+                Color32::from_rgb(0xf0, 0xb0, 0x5a),
+            );
+        }
+        let is_current = layout.reference.is_some_and(|r| (r - display.size).abs().max_element() < 1e-4);
+        if Button::new("今の画面を基準にする", widgets::BUTTON)
+            .width(ui.available_width())
+            .enabled(!is_current)
+            .show(ui)
+            .on_hover_text("この画面で、のぞき窓に映っている範囲を、シーンの基準にする")
+            .clicked()
+        {
+            *action = Some(Action::SetReference);
+        }
+    });
+
+    // ここから下は機材プロファイル (このPCと設置場所の値)。シーンではなく config.ini に保存する
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing = vec2(GAP, 4.0);
+        widgets::sub_header(ui, "機材（このPC）");
+        widgets::wrapped_label(
+            ui,
+            "画面・距離・トラッキングは、このPCと設置場所の値です。シーンではなく config.ini に保存されます。",
+            10.5,
+            TEXT_HINT,
+        );
+    });
+
+    // 画面サイズ (比率はモニターの画素数から求めるので、入れるのは大きさだけ)
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing = vec2(GAP, 6.0);
         let mut open = !panel.screen_closed;
-        let summary = format!(
-            "{:.1}″ · {}:{}",
-            config.screen_diagonal_inches,
-            format_ratio(config.screen_aspect_width),
-            format_ratio(config.screen_aspect_height)
-        );
+        let summary = if config.screen_width_mm > 0.0 {
+            format!("幅 {:.0} mm", config.screen_width_mm)
+        } else {
+            format!("{:.1}″", config.screen_diagonal_inches)
+        };
         widgets::collapsing_header(ui, &mut open, "画面サイズ", &summary);
         panel.screen_closed = !open;
         if !open {
@@ -1304,54 +1374,26 @@ fn window_properties(
             NumberField::new(&mut config.screen_diagonal_inches, 0.1, 1)
                 .unit("インチ")
                 .range(1.0..=200.0)
-                .show(ui, ui.available_width());
+                .show(ui, ui.available_width())
+                .on_hover_text("画面の映る部分の対角 (縁は含めない)");
         });
         ui.horizontal(|ui| {
-            let width = (ui.available_width() - LABEL - 10.0 - GAP * 3.0) / 2.0;
-            widgets::fixed_label(ui, LABEL, 24.0, "アスペクト比", 12.0, TEXT_LABEL, Align::Min);
-            NumberField::new(&mut config.screen_aspect_width, 0.1, 1)
-                .prefix("横")
-                .range(0.1..=100.0)
-                .show(ui, width);
-            widgets::fixed_label(ui, 10.0, 24.0, ":", 12.0, TEXT_MUTED, Align::Center);
-            NumberField::new(&mut config.screen_aspect_height, 0.1, 1)
-                .prefix("縦")
-                .range(0.1..=100.0)
-                .show(ui, width);
+            widgets::fixed_label(ui, LABEL, 24.0, "幅", 12.0, TEXT_LABEL, Align::Min);
+            NumberField::new(&mut config.screen_width_mm, 1.0, 0)
+                .unit("mm")
+                .range(0.0..=5000.0)
+                .show(ui, ui.available_width())
+                .on_hover_text("定規で測った、映る部分の幅。0 なら対角から計算する (測った値のほうが正確)");
         });
-        ui.horizontal(|ui| {
-            let width = (ui.available_width() - LABEL - GAP * 3.0) / 3.0;
-            widgets::fixed_label(ui, LABEL, 22.0, "よく使う比", 11.0, TEXT_MUTED, Align::Min);
-            let current = config.screen_aspect_width / config.screen_aspect_height;
-            for (w, h) in ASPECT_PRESETS {
-                let on = (current - w / h).abs() < 1e-3;
-                let style = if on { widgets::BUTTON_CHIP_ON } else { widgets::BUTTON_CHIP };
-                let label = format!("{}:{}", w, h);
-                let clicked = Button::new(&label, style)
-                    .width(width)
-                    .height(22.0)
-                    .font_size(11.0)
-                    .radius(3)
-                    .show(ui)
-                    .clicked();
-                if clicked {
-                    config.screen_aspect_width = w;
-                    config.screen_aspect_height = h;
-                }
-            }
-        });
-        let (width, height) = config.screen_size();
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), egui::Sense::hover());
-        let painter = ui.painter();
-        painter.rect(rect, CornerRadius::same(4), WELL, widgets::hairline(WELL_BORDER), egui::StrokeKind::Inside);
-        let inner = rect.shrink2(vec2(8.0, 0.0));
-        painter.text(inner.left_center(), Align2::LEFT_CENTER, "実寸", egui::FontId::proportional(11.0), TEXT_MUTED);
-        painter.text(
-            inner.right_center(),
-            Align2::RIGHT_CENTER,
-            format!("幅 {:.3} m × 高さ {:.3} m", width, height),
-            egui::FontId::proportional(12.0),
-            Color32::from_gray(0xdc),
+        info_row(
+            ui,
+            "比率",
+            &format!("{}×{}（モニターから）", display.pixels.x, display.pixels.y),
+        );
+        info_row(
+            ui,
+            "実寸",
+            &format!("幅 {:.3} m × 高さ {:.3} m", display.size.x, display.size.y),
         );
     });
 
@@ -1381,15 +1423,78 @@ fn window_properties(
                 .show(ui, width);
         });
     });
+
+    // トラッキング (OpenTrack)
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing = vec2(GAP, 6.0);
+        let mut open = !panel.tracking_closed;
+        let summary = format!("マーカー {:.1} cm · 視野角 {:.0}°", config.marker_size_cm, config.camera_fov_deg);
+        widgets::collapsing_header(ui, &mut open, "トラッキング", &summary);
+        panel.tracking_closed = !open;
+        if !open {
+            return;
+        }
+
+        ui.horizontal(|ui| {
+            widgets::fixed_label(ui, LABEL, 24.0, "マーカー", 12.0, TEXT_LABEL, Align::Min);
+            NumberField::new(&mut config.marker_size_cm, 0.1, 1)
+                .unit("cm")
+                .range(0.5..=50.0)
+                .show(ui, ui.available_width())
+                .on_hover_text("印刷した AR マーカーの黒い四角の一辺。定規で測った値を入れる");
+        });
+        if (config.marker_size_cm - ARUCO_MARKER_SIZE_CM).abs() > 0.05 {
+            widgets::wrapped_label(
+                ui,
+                &format!(
+                    "OpenTrack はマーカーを {:.0} cm として距離を出すので、頭の動きを {:.2} 倍に直して使います。",
+                    ARUCO_MARKER_SIZE_CM,
+                    config.marker_scale()
+                ),
+                10.5,
+                TEXT_HINT,
+            );
+        }
+        ui.horizontal(|ui| {
+            widgets::fixed_label(ui, LABEL, 24.0, "視野角", 12.0, TEXT_LABEL, Align::Min);
+            NumberField::new(&mut config.camera_fov_deg, 1.0, 0)
+                .unit("°")
+                .range(10.0..=170.0)
+                .show(ui, ui.available_width())
+                .on_hover_text("カメラの対角の視野角。OpenTrack が距離の計算に使う (初期値 56°)");
+        });
+        ui.horizontal(|ui| {
+            widgets::fixed_label(ui, LABEL, 24.0, "カメラ", 12.0, TEXT_LABEL, Align::Min);
+            ui.add(
+                egui::TextEdit::singleline(&mut config.opentrack_camera)
+                    .hint_text("空なら OpenTrack の設定のまま")
+                    .desired_width(ui.available_width()),
+            )
+            .on_hover_text("OpenTrack で使うカメラの名前。OpenTrack の画面に出る名前をそのまま入れる");
+        });
+        widgets::wrapped_label(
+            ui,
+            "視野角とカメラは、保存すると OpenTrack に書き込み、OpenTrack を起動し直します（数秒トラッキングが止まります）。",
+            10.5,
+            TEXT_HINT,
+        );
+    });
 }
 
-// 16.0 → "16"、16.5 → "16.5"
-fn format_ratio(value: f32) -> String {
-    if value.fract() == 0.0 {
-        format!("{}", value as i64)
-    } else {
-        format!("{:.1}", value)
-    }
+// 左に見出し、右に値を出す、枠付きの1行
+fn info_row(ui: &mut Ui, label: &str, value: &str) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect(rect, CornerRadius::same(4), WELL, widgets::hairline(WELL_BORDER), egui::StrokeKind::Inside);
+    let inner = rect.shrink2(vec2(8.0, 0.0));
+    painter.text(inner.left_center(), Align2::LEFT_CENTER, label, egui::FontId::proportional(11.0), TEXT_MUTED);
+    painter.text(
+        inner.right_center(),
+        Align2::RIGHT_CENTER,
+        value,
+        egui::FontId::proportional(12.0),
+        Color32::from_gray(0xdc),
+    );
 }
 
 // ---------------------------------------------------------------- 操作方法
@@ -1554,7 +1659,7 @@ fn save_as_dialog(ctx: &egui::Context, dialog: &mut SaveAsDialog, current: Optio
 
 fn delete_scene_dialog(ctx: &egui::Context, name: &str, is_current: bool, action: &mut Option<Action>) {
     let title = format!("シーン「{}」を削除しますか?", name);
-    let mut body = "シーンファイルを削除します。元に戻せません。ワールドやモデルのファイルは消えません。".to_string();
+    let mut body = "シーンファイル (.peek) を削除します。中のワールドやモデルも一緒に消え、元に戻せません。".to_string();
     if is_current {
         body.push_str("今開いているシーンなので、削除したあとは別のシーンを開きます。");
     }

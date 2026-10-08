@@ -1,14 +1,14 @@
 // アプリ内に保存しておくシーンの一覧。
-// scenes/<名前>.ini に1シーンずつ保存し、最後に開いたシーンの名前を scenes/current.txt に覚えておく
+// scenes/<名前>.peek に1シーンずつ保存し、最後に開いたシーンの名前を scenes/current.txt に覚えておく
 use bevy::prelude::*;
 use std::path::PathBuf;
 
 use crate::scene::layout::SceneLayout;
+use crate::scene::package::{self, PEEK_EXTENSION, PackageFiles};
+use crate::scene::package_store::PackageStore;
 
 const SCENES_DIR: &str = "scenes";
 const CURRENT_FILE: &str = "current.txt";
-// 以前の保存先。scenes/ が空なら、これを最初のシーンとして移す
-const LEGACY_SCENE_FILE: &str = "scene.ini";
 // 最初に作るシーンの名前
 const FIRST_SCENE_NAME: &str = "default";
 // ファイル名に使えない文字
@@ -24,12 +24,11 @@ pub struct SceneLibrary {
 }
 
 impl SceneLibrary {
-    // 起動時に、最後に開いたシーンを読み込む
-    pub fn open() -> (Self, SceneLayout) {
+    // 起動時に、最後に開いたシーンを読み込む (シーンの中のファイルも返す)
+    pub fn open() -> (Self, SceneLayout, PackageFiles) {
         if let Err(e) = std::fs::create_dir_all(SCENES_DIR) {
             warn!("{} フォルダを作成できませんでした: {}", SCENES_DIR, e);
         }
-        migrate_legacy_scene();
 
         let names = list();
         let remembered = std::fs::read_to_string(dir().join(CURRENT_FILE))
@@ -39,28 +38,33 @@ impl SceneLibrary {
         let name = remembered.or_else(|| names.first().cloned());
 
         let Some(name) = name else {
-            // シーンが1つも無いときは、初期配置で作る
-            let layout = SceneLayout::default();
+            // シーンが1つも無いときは、空のシーンを作る
+            let layout = SceneLayout::empty();
+            let files = PackageFiles::new();
             let mut library = Self::untitled(FIRST_SCENE_NAME);
-            match library.save_as(FIRST_SCENE_NAME, &layout) {
-                Ok(()) => info!("シーンが無かったので初期配置で {} を作成しました", FIRST_SCENE_NAME),
+            match write(FIRST_SCENE_NAME, &layout, &files) {
+                Ok(()) => {
+                    library.current = Some(FIRST_SCENE_NAME.to_string());
+                    library.remember_current();
+                    info!("シーンが無かったので空のシーン {} を作成しました", FIRST_SCENE_NAME);
+                }
                 Err(e) => warn!("{}", e),
             }
-            return (library, layout);
+            return (library, layout, files);
         };
 
         match load(&name) {
-            Ok(layout) => {
+            Ok((layout, files)) => {
                 let library = Self {
                     current: Some(name.clone()),
                     suggested_name: name,
                 };
                 library.remember_current();
-                (library, layout)
+                (library, layout, files)
             }
             Err(e) => {
                 warn!("{}", e);
-                (Self::untitled(&name), SceneLayout::default())
+                (Self::untitled(&name), SceneLayout::empty(), PackageFiles::new())
             }
         }
     }
@@ -72,9 +76,10 @@ impl SceneLibrary {
         }
     }
 
-    // 今のシーンとして開く
-    pub fn open_scene(&mut self, name: &str) -> Result<SceneLayout, String> {
-        let layout = load(name)?;
+    // 今のシーンとして開く。シーンの中のファイルは store に入れる
+    pub fn open_scene(&mut self, name: &str, store: &mut PackageStore) -> Result<SceneLayout, String> {
+        let (layout, files) = load(name)?;
+        store.replace(files);
         self.current = Some(name.to_string());
         self.suggested_name = name.to_string();
         self.remember_current();
@@ -82,28 +87,28 @@ impl SceneLibrary {
     }
 
     // 今のシーンに上書き保存する (名前が無いときは Err)
-    pub fn save(&self, layout: &SceneLayout) -> Result<(), String> {
+    pub fn save(&self, layout: &SceneLayout, store: &PackageStore) -> Result<(), String> {
         let name = self
             .current
             .as_deref()
             .ok_or_else(|| "シーンに名前が付いていません".to_string())?;
-        write(name, layout)
+        write(name, layout, store.files())
     }
 
     // 名前を付けて保存し、そのシーンを今のシーンにする
-    pub fn save_as(&mut self, name: &str, layout: &SceneLayout) -> Result<(), String> {
+    pub fn save_as(&mut self, name: &str, layout: &SceneLayout, store: &PackageStore) -> Result<(), String> {
         let name = validate_name(name)?;
-        write(&name, layout)?;
+        write(&name, layout, store.files())?;
         self.current = Some(name.clone());
         self.suggested_name = name;
         self.remember_current();
         Ok(())
     }
 
-    // 保存してあるシーンを削除する (ワールドやモデルのファイルはほかのシーンでも使えるので消さない)。
+    // 保存してあるシーンを削除する。
     // 今のシーンを削除したときは、名前の無いシーンになる
     pub fn delete(&mut self, name: &str) -> Result<(), String> {
-        std::fs::remove_file(path(name))
+        std::fs::remove_file(scene_path(name))
             .map_err(|e| format!("シーン「{}」を削除できませんでした ({})", name, e))?;
         if self.current.as_deref() == Some(name) {
             self.current = None;
@@ -113,16 +118,17 @@ impl SceneLibrary {
     }
 
     // 最後に開いていたシーン (current.txt) を開き直す。無ければ空のシーンにする
-    pub fn reopen_last(&mut self) -> SceneLayout {
+    pub fn reopen_last(&mut self, store: &mut PackageStore) -> SceneLayout {
         let remembered = std::fs::read_to_string(dir().join(CURRENT_FILE))
             .ok()
             .map(|s| s.trim().to_string());
         if let Some(name) = remembered {
-            match self.open_scene(&name) {
+            match self.open_scene(&name, store) {
                 Ok(layout) => return layout,
                 Err(e) => warn!("{}", e),
             }
         }
+        store.replace(PackageFiles::new());
         SceneLayout::empty()
     }
 
@@ -148,8 +154,8 @@ pub fn list() -> Vec<String> {
     let mut names: Vec<String> = entries
         .filter_map(|entry| {
             let path = entry.ok()?.path();
-            let is_ini = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("ini"));
-            if !is_ini || !path.is_file() {
+            let is_peek = path.extension().is_some_and(|e| e.eq_ignore_ascii_case(PEEK_EXTENSION));
+            if !is_peek || !path.is_file() {
                 return None;
             }
             Some(path.file_stem()?.to_string_lossy().into_owned())
@@ -160,7 +166,7 @@ pub fn list() -> Vec<String> {
 }
 
 pub fn exists(name: &str) -> bool {
-    validate_name(name).is_ok_and(|name| path(&name).is_file())
+    validate_name(name).is_ok_and(|name| scene_path(&name).is_file())
 }
 
 // 名前を確かめ、前後の空白を除いたものを返す
@@ -200,31 +206,18 @@ pub fn unique_name(base: &str) -> String {
     name
 }
 
-fn path(name: &str) -> PathBuf {
-    dir().join(format!("{}.ini", name))
+// シーンファイルの場所
+pub fn scene_path(name: &str) -> PathBuf {
+    dir().join(format!("{}.{}", name, PEEK_EXTENSION))
 }
 
-fn load(name: &str) -> Result<SceneLayout, String> {
-    std::fs::read_to_string(path(name))
-        .map(|text| SceneLayout::parse(&text))
-        .map_err(|e| format!("シーン「{}」を読めませんでした ({})", name, e))
+fn load(name: &str) -> Result<(SceneLayout, PackageFiles), String> {
+    package::read_peek(&scene_path(name)).map_err(|e| format!("シーン「{}」を読めませんでした ({})", name, e))
 }
 
-fn write(name: &str, layout: &SceneLayout) -> Result<(), String> {
+fn write(name: &str, layout: &SceneLayout, files: &PackageFiles) -> Result<(), String> {
     std::fs::create_dir_all(dir())
-        .and_then(|_| std::fs::write(path(name), layout.to_ini()))
+        .map_err(|e| e.to_string())
+        .and_then(|_| package::write_peek(&scene_path(name), layout, files))
         .map_err(|e| format!("シーン「{}」に書き込めません ({})", name, e))
-}
-
-// 以前の scene.ini を scenes/default.ini に移す
-fn migrate_legacy_scene() {
-    let legacy = PathBuf::from(LEGACY_SCENE_FILE);
-    if !legacy.is_file() || !list().is_empty() {
-        return;
-    }
-    let dest = path(FIRST_SCENE_NAME);
-    match std::fs::rename(&legacy, &dest) {
-        Ok(()) => info!("{} を {} に移しました", LEGACY_SCENE_FILE, dest.display()),
-        Err(e) => warn!("{} を {} に移せませんでした: {}", LEGACY_SCENE_FILE, dest.display(), e),
-    }
 }

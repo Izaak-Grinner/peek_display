@@ -8,14 +8,19 @@ mod tracking;
 mod ui;
 
 fn main() {
-    let (library, layout) = scene::library::SceneLibrary::open();
     let mut app = App::new();
+    // シーンの中のファイルの読み込み元は、DefaultPlugins より前に登録する
+    let mut store = scene::package_store::PackageStore::register(&mut app);
+    let (library, layout, files) = scene::library::SceneLibrary::open();
+    store.replace(files);
     app.insert_resource(config::AppConfig::load())
+        .insert_resource(store)
         .insert_resource(library)
         .insert_resource(layout)
         .add_plugins((DefaultPlugins, MeshPickingPlugin))
         .add_plugins((
             app_mode::AppModePlugin,
+            config::DisplayPlugin,
             ui::UiPlugin,
             scene::scene::ScenePlugin,
             scene::editor::EditorPlugin,

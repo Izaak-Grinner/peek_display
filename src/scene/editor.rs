@@ -4,6 +4,7 @@ use crate::app_mode::AppMode;
 use crate::config::AppConfig;
 use crate::scene::layout::{Placement, SceneLayout};
 use crate::scene::library::{self, SceneLibrary};
+use crate::scene::package_store::PackageStore;
 use crate::scene::highlight::SELECTION_COLOR;
 use crate::scene::scene::Placeable;
 use crate::scene::world::{self, WorldInfo, WorldNode};
@@ -45,7 +46,7 @@ pub enum Pending {
     New,
     // 保存してあるシーンを開く
     Open(String),
-    // .zip のシーンをインポートする
+    // シーン (.peek) をインポートする
     ImportScene,
     // ワールド (.glb) をインポートし、新しいシーンとして開く
     ImportWorld,
@@ -134,6 +135,11 @@ impl EditState {
         library.current.is_none() || !layout.same_content(&self.saved_layout) || *config != self.saved_config
     }
 
+    // 最後に保存した (または読み込んだ) 機材プロファイル
+    pub fn saved_config(&self) -> &AppConfig {
+        &self.saved_config
+    }
+
     // ダイアログが出ているか (出ている間は 3D 側のキー操作を止める)
     pub fn dialog_open(&self) -> bool {
         self.confirm_discard.is_some()
@@ -143,8 +149,8 @@ impl EditState {
     }
 
     // 今のシーンと config.ini を上書き保存する。名前が無いシーンは保存できない
-    pub fn save(&mut self, layout: &SceneLayout, config: &AppConfig, library: &SceneLibrary) -> bool {
-        let result = library.save(layout).and_then(|_| save_config(config));
+    pub fn save(&mut self, layout: &SceneLayout, config: &AppConfig, library: &SceneLibrary, store: &PackageStore) -> bool {
+        let result = library.save(layout, store).and_then(|_| save_config(config));
         self.finish_save(result, layout, config)
     }
 
@@ -155,6 +161,7 @@ impl EditState {
         layout: &SceneLayout,
         config: &AppConfig,
         library: &mut SceneLibrary,
+        store: &PackageStore,
     ) -> bool {
         if let Err(e) = library::validate_name(name) {
             if let Some(dialog) = &mut self.save_as {
@@ -162,7 +169,7 @@ impl EditState {
             }
             return false;
         }
-        let result = library.save_as(name, layout).and_then(|_| save_config(config));
+        let result = library.save_as(name, layout, store).and_then(|_| save_config(config));
         self.finish_save(result, layout, config)
     }
 
@@ -262,11 +269,17 @@ impl EditState {
 
     // 保存していない変更を捨てて、保存してある内容に戻す。
     // 名前の無いシーンは捨てて、最後に保存したシーンを開き直す
-    pub fn discard(&mut self, layout: &mut SceneLayout, config: &mut AppConfig, library: &mut SceneLibrary) {
+    pub fn discard(
+        &mut self,
+        layout: &mut SceneLayout,
+        config: &mut AppConfig,
+        library: &mut SceneLibrary,
+        store: &mut PackageStore,
+    ) {
         if library.current.is_some() {
             layout.replace_with(self.saved_layout.clone());
         } else {
-            layout.replace_with(library.reopen_last());
+            layout.replace_with(library.reopen_last(store));
         }
         *config = self.saved_config.clone();
         self.scene_switched(layout);
