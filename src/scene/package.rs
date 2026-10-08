@@ -1,6 +1,6 @@
-// シーンファイル (.peek)。中身は zip で、scene.ini と、シーンが使うワールド・モデルのファイルを入れる。
+// シーンファイル (.peek)。中身は zip で、scene.ini と、シーンが使うモデルのファイルを入れる。
 // このファイル1つを渡せば、ほかのPCでも同じシーンが開ける。
-// ファイルはシーンの中の相対パスで入れる (例: world/room.glb、models/izayoi/izayoi_02.glb)
+// ファイルはシーンの中の相対パスで入れる (例: models/room/room.glb、models/izayoi/izayoi_02.glb)
 use bevy::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
@@ -10,11 +10,11 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use crate::scene::editor::EditState;
 use crate::scene::import::referenced_uris;
-use crate::scene::layout::{ObjectKind, SceneLayout};
+use crate::scene::layout::SceneLayout;
 use crate::scene::library::{self, SceneLibrary};
 use crate::scene::package_store::PackageStore;
 
-pub const PEEK_EXTENSION: &str = "peek";
+pub const SCENE_EXTENSION: &str = "peek";
 // .peek の中のシーンの設定
 const SCENE_ENTRY: &str = "scene.ini";
 
@@ -23,7 +23,7 @@ pub type PackageFiles = BTreeMap<String, Vec<u8>>;
 
 // ---------------------------------------------------------------- 読み書き
 
-pub fn read_peek(path: &Path) -> Result<(SceneLayout, PackageFiles), String> {
+pub fn read_scene_file(path: &Path) -> Result<(SceneLayout, PackageFiles), String> {
     let file = std::fs::File::open(path)
         .map_err(|e| format!("{} を開けませんでした: {}", path.display(), e))?;
     let mut zip = zip::ZipArchive::new(file)
@@ -59,8 +59,8 @@ pub fn read_peek(path: &Path) -> Result<(SceneLayout, PackageFiles), String> {
 }
 
 // シーンが参照しているファイルだけを書く。一時ファイルに書いてから置き換え、途中で失敗しても元のファイルを壊さない
-pub fn write_peek(path: &Path, layout: &SceneLayout, files: &PackageFiles) -> Result<(), String> {
-    let temp = path.with_extension(format!("{}.tmp", PEEK_EXTENSION));
+pub fn write_scene_file(path: &Path, layout: &SceneLayout, files: &PackageFiles) -> Result<(), String> {
+    let temp = path.with_extension(format!("{}.tmp", SCENE_EXTENSION));
     let result = write_zip(&temp, layout, files).and_then(|_| {
         std::fs::rename(&temp, path).map_err(|e| format!("{} に書き込めませんでした: {}", path.display(), e))
     });
@@ -100,12 +100,9 @@ fn write_zip(path: &Path, layout: &SceneLayout, files: &PackageFiles) -> Result<
     Ok(())
 }
 
-// シーンが使うワールドとモデルのパス
+// シーンが使うモデルのパス
 fn used_files(layout: &SceneLayout) -> impl Iterator<Item = &String> {
-    layout.world.iter().chain(layout.objects.iter().filter_map(|o| match &o.kind {
-        ObjectKind::Model { path } => Some(path),
-        ObjectKind::Cube { .. } => None,
-    }))
+    layout.objects.iter().filter_map(|o| o.model()).map(|m| &m.path)
 }
 
 // モデルが使うファイルの一覧。.gltf は .bin やテクスチャを別ファイルで参照しているので、それも含める
@@ -178,7 +175,7 @@ impl PackageState {
     pub fn start_export(&mut self, layout: &SceneLayout, files: &PackageFiles, name: &str) {
         let layout = layout.clone();
         let files = files.clone();
-        let file_name = format!("{}.{}", name, PEEK_EXTENSION);
+        let file_name = format!("{}.{}", name, SCENE_EXTENSION);
         self.start(move || run_export(&layout, &files, &file_name));
     }
 
@@ -251,13 +248,13 @@ fn poll_package(
 fn run_export(layout: &SceneLayout, files: &PackageFiles, file_name: &str) -> PackageResult {
     let Some(dest) = rfd::FileDialog::new()
         .set_title("シーンをエクスポート")
-        .add_filter("シーン (.peek)", &[PEEK_EXTENSION])
+        .add_filter("シーン (.peek)", &[SCENE_EXTENSION])
         .set_file_name(file_name)
         .save_file()
     else {
         return PackageResult::Cancelled;
     };
-    match write_peek(&dest, layout, files) {
+    match write_scene_file(&dest, layout, files) {
         Ok(()) => PackageResult::Exported(display_name(&dest)),
         Err(e) => PackageResult::Failed(e),
     }
@@ -266,13 +263,13 @@ fn run_export(layout: &SceneLayout, files: &PackageFiles, file_name: &str) -> Pa
 fn run_import() -> PackageResult {
     let Some(source) = rfd::FileDialog::new()
         .set_title("シーンをインポート")
-        .add_filter("シーン (.peek)", &[PEEK_EXTENSION])
+        .add_filter("シーン (.peek)", &[SCENE_EXTENSION])
         .pick_file()
     else {
         return PackageResult::Cancelled;
     };
     // 読めるファイルか先に確かめてから、scenes フォルダにコピーする
-    if let Err(e) = read_peek(&source) {
+    if let Err(e) = read_scene_file(&source) {
         return PackageResult::Failed(e);
     }
     let stem = source
@@ -296,21 +293,22 @@ fn display_name(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scene::layout::Placement;
+    use crate::scene::layout::{Model, ObjectKind, Placement};
 
     // 書き出した .peek を読み直すと、同じシーンと同じファイルに戻る。参照していないファイルは書かない
     #[test]
     fn write_then_read_round_trip() {
         let mut layout = SceneLayout::default();
-        layout.world = Some("world/room.gltf".to_string());
-        layout.world_source = Some(r"C:\blender\room.gltf".to_string());
-        layout.world_override_mut("Cube").hidden = true;
-        layout.world_override_mut("Light").placement = Some(Placement {
+        let mut room = Model::new("models/room/room.gltf", Some(r"C:\blender\room.gltf".to_string()));
+        room.node_mut("Cube").hidden = true;
+        room.node_mut("Chair").placement = Some(Placement {
             position: Vec3::new(0.1, 0.2, 0.3),
             yaw_deg: 30.0,
             scale: 2.0,
             ..default()
         });
+        layout.add_object("room", ObjectKind::Model(room), Placement::default());
+        layout.show_room = false;
         layout.reference = Some(Vec2::new(0.3446, 0.2154));
         layout.light.illuminance = 1234.0;
         layout.light.ambient = 20.0;
@@ -318,16 +316,16 @@ mod tests {
         layout.light.yaw_deg = 45.0;
 
         let mut files = PackageFiles::new();
-        files.insert("world/room.gltf".into(), br#"{"buffers":[{"uri":"room.bin"}]}"#.to_vec());
-        files.insert("world/room.bin".into(), vec![1, 2, 3]);
+        files.insert("models/room/room.gltf".into(), br#"{"buffers":[{"uri":"room.bin"}]}"#.to_vec());
+        files.insert("models/room/room.bin".into(), vec![1, 2, 3]);
         files.insert("models/izayoi/izayoi_02.glb".into(), vec![4, 5, 6]);
         files.insert("models/unused/unused.glb".into(), vec![7]);
 
         let dir = std::env::temp_dir().join(format!("peek_display_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("scene.peek");
-        write_peek(&path, &layout, &files).unwrap();
-        let (loaded, loaded_files) = read_peek(&path).unwrap();
+        write_scene_file(&path, &layout, &files).unwrap();
+        let (loaded, loaded_files) = read_scene_file(&path).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
 
         assert!(layout.same_content(&loaded));

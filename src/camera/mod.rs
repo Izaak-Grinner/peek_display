@@ -1,4 +1,4 @@
-pub mod inset;
+pub mod camera_preview;
 pub mod main_camera;
 pub mod off_axis_projection;
-pub mod preview;
+pub mod scene_view;

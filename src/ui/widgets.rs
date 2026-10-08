@@ -47,7 +47,7 @@ pub mod color {
     pub const AXIS_Y: Color32 = hex(0x8fd14f);
     pub const AXIS_Z: Color32 = hex(0x5aa9ff);
 
-    pub const ICON_WINDOW: Color32 = hex(0x6fa8ff);
+    pub const ICON_SCREEN: Color32 = hex(0x6fa8ff);
     pub const ICON_MODEL: Color32 = hex(0xe6a95c);
     pub const ICON_LIGHT: Color32 = hex(0xf2d06b);
     pub const ICON_CUBE: Color32 = hex(0xb9b9b9);
@@ -458,6 +458,23 @@ pub fn collapsing_header(ui: &mut Ui, open: &mut bool, title: &str, summary: &st
 
 // シーン一覧の 1 行
 pub fn list_row(ui: &mut Ui, selected: bool, icon: Icon, icon_color: Color32, name: &str, tag: &str) -> Response {
+    indented_row(ui, 0.0, selected, icon, icon_color, name, tag)
+}
+
+// シーン一覧の、モデルの中のノードの 1 行 (モデルの行の下に字下げして出す)
+pub fn child_row(ui: &mut Ui, selected: bool, icon: Icon, icon_color: Color32, name: &str, tag: &str) -> Response {
+    indented_row(ui, 16.0, selected, icon, icon_color, name, tag)
+}
+
+fn indented_row(
+    ui: &mut Ui,
+    indent: f32,
+    selected: bool,
+    icon: Icon,
+    icon_color: Color32,
+    name: &str,
+    tag: &str,
+) -> Response {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
     if ui.is_rect_visible(rect) {
         let fill = if selected {
@@ -473,14 +490,14 @@ pub fn list_row(ui: &mut Ui, selected: bool, icon: Icon, icon_color: Color32, na
         let center_y = rect.center().y;
         draw_icon(
             painter,
-            Rect::from_center_size(pos2(rect.left() + 15.0, center_y), Vec2::splat(14.0)),
+            Rect::from_center_size(pos2(rect.left() + indent + 15.0, center_y), Vec2::splat(14.0)),
             icon,
             icon_color,
             1.35,
         );
         let tag = text(ui, tag, 10.5, if selected { SELECTED_TAG } else { TEXT_MUTED });
         let tag_x = rect.right() - 8.0 - tag.size().x;
-        let name_x = rect.left() + 30.0;
+        let name_x = rect.left() + indent + 30.0;
         let name = truncated_text(
             ui,
             name,

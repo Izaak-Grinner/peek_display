@@ -1,5 +1,5 @@
 use crate::app_mode::AppMode;
-use crate::camera::main_camera::MainDisplayCamera;
+use crate::camera::main_camera::MainCamera;
 use crate::config::DisplayInfo;
 use crate::scene::editor::{EditState, Selection};
 use crate::scene::highlight::SELECTION_COLOR;
@@ -12,13 +12,13 @@ use bevy::{
     window::{CursorGrabMode, CursorOptions, PrimaryWindow},
 };
 
-// 座標軸ギズモをプレビューカメラだけに表示するための専用レイヤー
+// 座標軸ギズモをシーンビューのカメラだけに表示するための専用レイヤー
 pub const GIZMO_LAYER: usize = 1;
 
-// ホーム画面で背景の俯瞰カメラを自動で回す速さ(rad/s)
+// ホーム画面で背景のシーンビューを自動で回す速さ(rad/s)
 const HOME_ROTATE_SPEED: f32 = 0.1;
 
-// 選択中ののぞき窓の縁取り。同じ形を太いオレンジ線で先に描き、その上に細い線を重ねる
+// 選択中のスクリーンの縁取り。同じ形を太いオレンジ線で先に描き、その上に細い線を重ねる
 #[derive(Default, Reflect, GizmoConfigGroup)]
 struct SelectionOutlineGizmos;
 
@@ -28,9 +28,9 @@ const OUTLINE_LINE_WIDTH: f32 = 8.0;
 // ホイールを押しながらのドラッグで平行移動する量 (カメラまでの距離 1m あたり、1ピクセルで動く長さ)
 const PAN_SPEED: f32 = 0.0015;
 
-// 俯瞰プレビュー用カメラ（マウス操作可能）。focus を中心に回る
+// シーンビューのカメラ (マウスで操作できる)。focus を中心に回る
 #[derive(Component)]
-pub struct PreviewCamera {
+pub struct SceneViewCamera {
     radius: f32,
     alpha: f32, // 横回転
     beta: f32,  // 縦回転
@@ -38,7 +38,7 @@ pub struct PreviewCamera {
     focus: Vec3,
 }
 
-impl Default for PreviewCamera {
+impl Default for SceneViewCamera {
     fn default() -> Self {
         Self {
             radius: 4.0,
@@ -49,19 +49,19 @@ impl Default for PreviewCamera {
     }
 }
 
-//プレビューカメラをプラグイン化
-pub struct PreviewPlugin;
+// シーンビューのカメラをプラグイン化
+pub struct SceneViewPlugin;
 
-impl Plugin for PreviewPlugin {
+impl Plugin for SceneViewPlugin {
     fn build(&self, app: &mut App) {
         app.init_gizmo_group::<SelectionOutlineGizmos>()
-            .add_systems(Startup, (setup_preview_camera, setup_gizmo_layer))
-            .add_systems(Update, (control_preview_camera, draw_grid_and_gizmos));
+            .add_systems(Startup, (setup_scene_view_camera, setup_gizmo_layer))
+            .add_systems(Update, (control_scene_view_camera, draw_grid_and_gizmos));
     }
 }
 
 // 有効/無効と描画範囲は、モードに合わせて app_mode が切り替える
-fn setup_preview_camera(mut commands: Commands) {
+fn setup_scene_view_camera(mut commands: Commands) {
     commands.spawn((
         Camera3d::default(),
         Camera {
@@ -70,13 +70,13 @@ fn setup_preview_camera(mut commands: Commands) {
             ..default()
         },
         Transform::from_xyz(2.0, 2.0, 3.0).looking_at(Vec3::ZERO, Vec3::Y),
-        PreviewCamera::default(),
+        SceneViewCamera::default(),
         // 通常のシーン(レイヤー0)に加えて、ギズモ専用レイヤーも見えるようにする
         RenderLayers::from_layers(&[0, GIZMO_LAYER]),
     ));
 }
 
-// 座標軸ギズモをプレビューカメラ専用レイヤーに割り当てる
+// 座標軸ギズモをシーンビュー専用レイヤーに割り当てる
 fn setup_gizmo_layer(mut config_store: ResMut<GizmoConfigStore>) {
     let (config, _) = config_store.config_mut::<DefaultGizmoConfigGroup>();
     config.render_layers = RenderLayers::layer(GIZMO_LAYER);
@@ -97,30 +97,30 @@ fn draw_grid_and_gizmos(
     layout: Res<SceneLayout>,
     mode: Res<State<AppMode>>,
     state: Res<EditState>,
-    main_cam_query: Query<&Transform, With<MainDisplayCamera>>,
+    main_cam_query: Query<&Transform, With<MainCamera>>,
 ) {
     //原点に XYZ 軸線を描く (R=X, G=Y, B=Z)
     gizmos.axes(Transform::IDENTITY, 5.0);
 
-    // のぞき込みカメラの視覚化 (目の位置の球・視線・ディスプレイ枠)。
+    // メインカメラの視覚化 (目の位置の球・視線・スクリーンの枠)。
     // 座標軸 (赤・緑・青) や選択の色 (オレンジ) と見分けられるよう、マゼンタで描く。
-    // のぞき窓を選んでいるときは、同じ形を太いオレンジ線でも描いて縁取る
+    // スクリーンを選んでいるときは、同じ形を太いオレンジ線でも描いて縁取る
     let camera_color = LinearRgba::new(1.0, 0.35, 0.85, 1.0);
-    let selected = *mode.get() == AppMode::Edit && state.selection == Some(Selection::Window);
-    let window_center = layout.window.position;
+    let selected = *mode.get() == AppMode::Edit && state.selection == Some(Selection::Screen);
+    let screen_center = layout.screen.position;
     if let Ok(cam_transform) = main_cam_query.single() {
         let cam_pos = cam_transform.translation;
 
         gizmos.sphere(cam_pos, 0.03, camera_color);
-        gizmos.line(cam_pos, window_center, camera_color);
+        gizmos.line(cam_pos, screen_center, camera_color);
         if selected {
             outline.sphere(cam_pos, 0.03, SELECTION_COLOR);
-            outline.line(cam_pos, window_center, SELECTION_COLOR);
+            outline.line(cam_pos, screen_center, SELECTION_COLOR);
         }
     }
 
-    // 実際に使う窓 (この画面の大きさ × 縮尺)
-    let frame = Isometry3d::new(window_center, layout.window.rotation());
+    // 実際に使うスクリーン (この画面の大きさ × 縮尺)
+    let frame = Isometry3d::new(screen_center, layout.screen.rotation());
     let frame_size = display.size * display.view_scale(layout.reference);
     gizmos.rect(frame, frame_size, camera_color);
     if selected {
@@ -134,14 +134,14 @@ fn draw_grid_and_gizmos(
     }
 }
 
-// プレビューカメラのマウス操作 (Orbit Camera)
+// シーンビューのマウス操作 (Orbit Camera)
 // カーソルがこのカメラの描画範囲内にあり、UIの上にないときだけ操作を受け付ける
-fn control_preview_camera(
+fn control_scene_view_camera(
     mode: Res<State<AppMode>>,
     time: Res<Time>,
     ui_input: Res<UiInputState>,
     window: Single<(&mut Window, &mut CursorOptions), With<PrimaryWindow>>,
-    mut camera_query: Query<(&mut Transform, &mut PreviewCamera, &Camera)>,
+    mut camera_query: Query<(&mut Transform, &mut SceneViewCamera, &Camera)>,
     mut mouse_motion: MessageReader<MouseMotion>,
     mut mouse_wheel: MessageReader<MouseWheel>,
     mouse_button: Res<ButtonInput<MouseButton>>,

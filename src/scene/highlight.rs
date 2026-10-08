@@ -1,14 +1,14 @@
 // 編集モードで選んでいるオブジェクトを、Blender のように形に沿ったオレンジの輪郭線で縁取る。
 // 輪郭線は画面上で縁を探して描く方式 (jump flood) なので、細い物や複雑な形でも太さがそろう。
-// 俯瞰ビューにだけ描き、覗き込みカメラ (小窓・本番) には映さない
+// シーンビューにだけ描き、メインカメラ (カメラプレビュー・本番) には映さない
 use bevy::{camera::visibility::RenderLayers, prelude::*};
 use bevy_mod_outline::{InheritOutline, OutlineMode, OutlinePlugin, OutlineRenderLayers, OutlineVolume};
 
 use crate::app_mode::AppMode;
-use crate::camera::preview::GIZMO_LAYER;
+use crate::camera::scene_view::GIZMO_LAYER;
 use crate::scene::editor::{EditState, Selection};
+use crate::scene::model::LoadedModels;
 use crate::scene::scene::Placeable;
-use crate::scene::world::WorldInfo;
 
 // 選択の色 (Blender の選択に近いオレンジ)
 pub const SELECTION_COLOR: Color = Color::srgb(1.0, 0.55, 0.1);
@@ -32,7 +32,7 @@ impl Plugin for HighlightPlugin {
 fn selected_entity(
     mode: &State<AppMode>,
     state: &EditState,
-    world: &WorldInfo,
+    models: &LoadedModels,
     placeables: &Query<(Entity, &Placeable)>,
 ) -> Option<Entity> {
     if *mode.get() != AppMode::Edit {
@@ -40,8 +40,8 @@ fn selected_entity(
     }
     match state.selection.as_ref()? {
         Selection::Object(id) => placeables.iter().find(|(_, p)| p.0 == *id).map(|(e, _)| e),
-        Selection::WorldNode(name) => world.node(name).map(|n| n.entity),
-        Selection::Window | Selection::Light => None,
+        Selection::Node { object, name } => models.get(*object)?.node(name).map(|n| n.entity),
+        Selection::Screen | Selection::Light | Selection::Room => None,
     }
 }
 
@@ -51,13 +51,13 @@ fn update_outline(
     mut commands: Commands,
     mode: Res<State<AppMode>>,
     state: Res<EditState>,
-    world: Res<WorldInfo>,
+    models: Res<LoadedModels>,
     placeables: Query<(Entity, &Placeable)>,
     children: Query<&Children>,
     outlined: Query<Entity, With<Outlined>>,
     inherits: Query<(), With<InheritOutline>>,
 ) {
-    let target = selected_entity(&mode, &state, &world, &placeables);
+    let target = selected_entity(&mode, &state, &models, &placeables);
 
     // 前に選んでいたものの輪郭線を外す
     for entity in &outlined {
@@ -84,7 +84,7 @@ fn update_outline(
                 colour: SELECTION_COLOR,
             },
             OutlineMode::FloodFlat,
-            // 俯瞰カメラだけが見るレイヤーに描く
+            // シーンビューのカメラだけが見るレイヤーに描く
             OutlineRenderLayers(RenderLayers::layer(GIZMO_LAYER)),
         ));
     }

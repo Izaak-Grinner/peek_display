@@ -52,7 +52,7 @@ impl Placement {
         )
     }
 
-    // Transform から作る (scale は 1。ワールドのノードでは倍率として使うため)
+    // Transform から作る (scale は 1。モデルの中のノードでは倍率として使うため)
     pub fn from_transform(transform: &Transform) -> Self {
         let (yaw, pitch, roll) = transform.rotation.to_euler(EulerRot::YXZ);
         Self {
@@ -71,10 +71,61 @@ impl Placement {
     }
 }
 
+// モデルの中のノードに対する、アプリでの変更。ノードは Blender のオブジェクト名で区別する
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodeOverride {
+    pub name: String,
+    // 位置と回転は置き換え (モデルの中の座標)、scale は Blender での大きさに掛ける倍率。None なら Blender の値のまま
+    pub placement: Option<Placement>,
+    pub hidden: bool,
+}
+
+// .glb / .gltf のモデル
+#[derive(Clone, Debug, PartialEq)]
+pub struct Model {
+    // シーンの中の相対パス
+    pub path: String,
+    // 元のファイルの場所 (「再読み込み」で読み直す。無いPCでは使えない)
+    pub source: Option<String>,
+    // 中のノード (Blender で親を持たないオブジェクト) への変更
+    pub nodes: Vec<NodeOverride>,
+}
+
+impl Model {
+    pub fn new(path: &str, source: Option<String>) -> Self {
+        Self {
+            path: path.to_string(),
+            source,
+            nodes: Vec::new(),
+        }
+    }
+
+    pub fn node(&self, name: &str) -> Option<&NodeOverride> {
+        self.nodes.iter().find(|n| n.name == name)
+    }
+
+    // ノードの変更を取り出す。無ければ作る
+    pub fn node_mut(&mut self, name: &str) -> &mut NodeOverride {
+        if let Some(i) = self.nodes.iter().position(|n| n.name == name) {
+            return &mut self.nodes[i];
+        }
+        self.nodes.push(NodeOverride {
+            name: name.to_string(),
+            placement: None,
+            hidden: false,
+        });
+        self.nodes.last_mut().unwrap()
+    }
+
+    // 何も変えていないノードの記録を消す
+    pub fn prune_nodes(&mut self) {
+        self.nodes.retain(|n| n.placement.is_some() || n.hidden);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ObjectKind {
-    // assets フォルダからの相対パス (.glb / .gltf)
-    Model { path: String },
+    Model(Model),
     Cube { color: Vec3, size: f32 },
 }
 
@@ -85,8 +136,24 @@ pub struct SceneObject {
     pub name: String,
     pub kind: ObjectKind,
     pub placement: Placement,
-    // 読み込み完了後に大きさを自動調整する (インポート直後のみ。保存しない)
-    pub auto_fit: bool,
+    // インポートした直後。読み込みが終わったら置き方を決める (scene.rs。保存しない)
+    pub place_on_load: bool,
+}
+
+impl SceneObject {
+    pub fn model(&self) -> Option<&Model> {
+        match &self.kind {
+            ObjectKind::Model(model) => Some(model),
+            ObjectKind::Cube { .. } => None,
+        }
+    }
+
+    pub fn model_mut(&mut self) -> Option<&mut Model> {
+        match &mut self.kind {
+            ObjectKind::Model(model) => Some(model),
+            ObjectKind::Cube { .. } => None,
+        }
+    }
 }
 
 // シーンの照明。アプリが置く太陽光 (平行光源) と、全体をうっすら照らす環境光
@@ -102,7 +169,7 @@ pub struct LightSettings {
 }
 
 impl Default for LightSettings {
-    // 手前の上から、奥へ斜め下に照らす (のぞき窓から見える面が明るくなる)
+    // 手前の上から、奥へ斜め下に照らす (スクリーンから見える面が明るくなる)
     fn default() -> Self {
         Self {
             illuminance: 10_000.0,
@@ -124,43 +191,27 @@ impl LightSettings {
     }
 }
 
-// ワールド(.glb)の中のノードに対する、アプリでの変更。ノードは Blender のオブジェクト名で区別する
-#[derive(Clone, Debug, PartialEq)]
-pub struct WorldOverride {
-    pub node: String,
-    // 位置と回転は置き換え、scale は Blender での大きさに掛ける倍率。None なら Blender の値のまま
-    pub placement: Option<Placement>,
-    pub hidden: bool,
-}
-
-// のぞき窓(ディスプレイ面)とオブジェクトの配置。scenes/<名前>.ini に保存する (library.rs)
+// スクリーン (実際のディスプレイ) とオブジェクトの配置。scenes/<名前>.peek に保存する (library.rs)
 #[derive(Resource, Clone, Debug, PartialEq)]
 pub struct SceneLayout {
-    // Blender などで作ったワールド (シーンの中の相対パス)
-    pub world: Option<String>,
-    // ワールドの元のファイルの場所 (「ワールドを再読み込み」で読み直す。無いPCでは使えない)
-    pub world_source: Option<String>,
-    // のぞき窓の中心と向き (scale は使わない)
-    pub window: Placement,
+    // スクリーンの中心と向き (scale は使わない)
+    pub screen: Placement,
     // シーンを作ったときの画面の幅と高さ (m)。ほかの大きさの画面では、この範囲が全部入るように縮尺を変える
     pub reference: Option<Vec2>,
     pub light: LightSettings,
-    pub world_overrides: Vec<WorldOverride>,
+    // アプリが作る部屋 (床と壁) を表示するか
+    pub show_room: bool,
     pub objects: Vec<SceneObject>,
-    // ワールドの読み込みが終わったら、のぞき窓を peek_window の位置に合わせる (保存しない)
-    pub window_from_world: bool,
     next_id: u64,
 }
 
 impl Default for SceneLayout {
-    // シーンが1つも無いときの初期配置
+    // テスト用の、モデルとキューブを置いたシーン
     fn default() -> Self {
         let mut layout = Self::empty();
         layout.add_object(
             "izayoi",
-            ObjectKind::Model {
-                path: "models/izayoi/izayoi_02.glb".to_string(),
-            },
+            ObjectKind::Model(Model::new("models/izayoi/izayoi_02.glb", None)),
             Placement {
                 position: Vec3::new(0.0, FLOOR_Y, -0.4),
                 scale: 0.15,
@@ -183,28 +234,15 @@ impl Default for SceneLayout {
 }
 
 impl SceneLayout {
-    // のぞき窓だけの空のシーン
+    // スクリーンと部屋だけの空のシーン
     pub fn empty() -> Self {
         Self {
-            world: None,
-            world_source: None,
-            window: Placement::default(),
+            screen: Placement::default(),
             reference: None,
             light: LightSettings::default(),
-            world_overrides: Vec::new(),
+            show_room: true,
             objects: Vec::new(),
-            window_from_world: false,
             next_id: 0,
-        }
-    }
-
-    // ワールドだけのシーン。のぞき窓はワールドの peek_window に合わせる
-    pub fn with_world(path: &str, source: &str) -> Self {
-        Self {
-            world: Some(path.to_string()),
-            world_source: Some(source.to_string()),
-            window_from_world: true,
-            ..Self::empty()
         }
     }
 
@@ -216,7 +254,7 @@ impl SceneLayout {
             name: name.to_string(),
             kind,
             placement,
-            auto_fit: false,
+            place_on_load: false,
         });
         id
     }
@@ -229,36 +267,12 @@ impl SceneLayout {
         self.objects.iter().find(|o| o.id == id)
     }
 
-    pub fn world_override(&self, node: &str) -> Option<&WorldOverride> {
-        self.world_overrides.iter().find(|o| o.node == node)
-    }
-
-    // ノードの変更を取り出す。無ければ作る
-    pub fn world_override_mut(&mut self, node: &str) -> &mut WorldOverride {
-        if let Some(i) = self.world_overrides.iter().position(|o| o.node == node) {
-            return &mut self.world_overrides[i];
-        }
-        self.world_overrides.push(WorldOverride {
-            node: node.to_string(),
-            placement: None,
-            hidden: false,
-        });
-        self.world_overrides.last_mut().unwrap()
-    }
-
-    // 何も変えていないノードの記録を消す
-    pub fn prune_world_overrides(&mut self) {
-        self.world_overrides.retain(|o| o.placement.is_some() || o.hidden);
-    }
-
     // 保存される内容(id 以外)が同じか
     pub fn same_content(&self, other: &Self) -> bool {
-        self.world == other.world
-            && self.world_source == other.world_source
-            && self.window == other.window
+        self.screen == other.screen
             && self.reference == other.reference
             && self.light == other.light
-            && self.world_overrides == other.world_overrides
+            && self.show_room == other.show_room
             && self.objects.len() == other.objects.len()
             && self.objects.iter().zip(&other.objects).all(|(a, b)| {
                 a.name == b.name && a.kind == b.kind && a.placement == b.placement
@@ -280,25 +294,23 @@ impl SceneLayout {
             object.id = self.next_id;
             self.next_id += 1;
         }
-        self.world = other.world;
-        self.world_source = other.world_source;
-        self.window = other.window;
+        self.screen = other.screen;
         self.reference = other.reference;
         self.light = other.light;
-        self.world_overrides = other.world_overrides;
+        self.show_room = other.show_room;
         self.objects = other.objects;
-        self.window_from_world = other.window_from_world;
     }
 
     // シーンファイル形式の文字列を読む
     pub fn parse(text: &str) -> Self {
         enum Section {
-            World,
-            Window,
+            Screen,
             Reference,
             Light,
-            WorldNode(usize),
+            Room,
             Object(u64),
+            // 直前の [model] の中のノード (オブジェクトの id、nodes の位置)
+            Node(u64, usize),
             Unknown,
         }
         let mut layout = Self::empty();
@@ -312,25 +324,36 @@ impl SceneLayout {
 
             if let Some(name) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
                 section = match name.trim() {
-                    "world" => Section::World,
-                    "window" => Section::Window,
+                    "screen" => Section::Screen,
                     "light" => Section::Light,
                     "reference" => Section::Reference,
-                    "world_node" => {
-                        layout.world_overrides.push(WorldOverride {
-                            node: String::new(),
-                            placement: None,
-                            hidden: false,
-                        });
-                        Section::WorldNode(layout.world_overrides.len() - 1)
-                    }
+                    "room" => Section::Room,
                     "model" => Section::Object(layout.add_object(
                         "model",
-                        ObjectKind::Model {
-                            path: String::new(),
-                        },
+                        ObjectKind::Model(Model::new("", None)),
                         Placement::default(),
                     )),
+                    "node" => {
+                        let parent = match &section {
+                            Section::Object(id) | Section::Node(id, _) => Some(*id),
+                            _ => None,
+                        };
+                        let model = parent.and_then(|id| layout.object_mut(id)).and_then(|o| o.model_mut());
+                        match (parent, model) {
+                            (Some(id), Some(model)) => {
+                                model.nodes.push(NodeOverride {
+                                    name: String::new(),
+                                    placement: None,
+                                    hidden: false,
+                                });
+                                Section::Node(id, model.nodes.len() - 1)
+                            }
+                            _ => {
+                                warn!("{}: [model] の後ろにない [node] を無視しました", SCENE_FILE_NAME);
+                                Section::Unknown
+                            }
+                        }
+                    }
                     "cube" => Section::Object(layout.add_object(
                         "cube",
                         ObjectKind::Cube {
@@ -355,13 +378,8 @@ impl SceneLayout {
 
             match &section {
                 Section::Unknown => {}
-                Section::World => match key {
-                    "path" => layout.world = Some(value.to_string()).filter(|p| !p.is_empty()),
-                    "source" => layout.world_source = Some(value.to_string()).filter(|p| !p.is_empty()),
-                    _ => warn!("{}: 不明な設定項目を無視しました: {}", SCENE_FILE_NAME, key),
-                },
-                Section::Window => {
-                    if !parse_placement(&mut layout.window, key, value, false) {
+                Section::Screen => {
+                    if !parse_placement(&mut layout.screen, key, value, false) {
                         warn!("{}: 不明な設定項目を無視しました: {}", SCENE_FILE_NAME, key);
                     }
                 }
@@ -383,24 +401,18 @@ impl SceneLayout {
                         _ => warn!("{}: 不明な設定項目を無視しました: {}", SCENE_FILE_NAME, key),
                     }
                 }
-                Section::WorldNode(i) => {
-                    let o = &mut layout.world_overrides[*i];
-                    match key {
-                        "name" => o.node = value.to_string(),
-                        "hidden" => o.hidden = parse_or_warn(SCENE_FILE_NAME, key, value, o.hidden),
-                        _ => {
-                            let placement = o.placement.get_or_insert_with(Placement::default);
-                            if !parse_placement(placement, key, value, true) {
-                                warn!("{}: 不明な設定項目を無視しました: {}", SCENE_FILE_NAME, key);
-                            }
-                        }
-                    }
-                }
+                Section::Room => match key {
+                    "visible" => layout.show_room = parse_or_warn(SCENE_FILE_NAME, key, value, layout.show_room),
+                    _ => warn!("{}: 不明な設定項目を無視しました: {}", SCENE_FILE_NAME, key),
+                },
                 Section::Object(id) => {
                     let object = layout.objects.iter_mut().find(|o| o.id == *id).unwrap();
                     match (key, &mut object.kind) {
                         ("name", _) => object.name = value.to_string(),
-                        ("path", ObjectKind::Model { path }) => *path = value.to_string(),
+                        ("path", ObjectKind::Model(model)) => model.path = value.to_string(),
+                        ("source", ObjectKind::Model(model)) => {
+                            model.source = Some(value.to_string()).filter(|s| !s.is_empty())
+                        }
                         ("color", ObjectKind::Cube { color, .. }) => *color = parse_vec3(key, value, *color),
                         ("size", ObjectKind::Cube { size, .. }) => {
                             *size = parse_or_warn(SCENE_FILE_NAME, key, value, *size)
@@ -412,22 +424,40 @@ impl SceneLayout {
                         }
                     }
                 }
+                Section::Node(id, i) => {
+                    let Some(model) = layout.object_mut(*id).and_then(|o| o.model_mut()) else {
+                        continue;
+                    };
+                    let node = &mut model.nodes[*i];
+                    match key {
+                        "name" => node.name = value.to_string(),
+                        "hidden" => node.hidden = parse_or_warn(SCENE_FILE_NAME, key, value, node.hidden),
+                        _ => {
+                            let placement = node.placement.get_or_insert_with(Placement::default);
+                            if !parse_placement(placement, key, value, true) {
+                                warn!("{}: 不明な設定項目を無視しました: {}", SCENE_FILE_NAME, key);
+                            }
+                        }
+                    }
+                }
             }
         }
 
         layout.objects.retain(|o| match &o.kind {
-            ObjectKind::Model { path } if path.is_empty() => {
+            ObjectKind::Model(model) if model.path.is_empty() => {
                 warn!("{}: path の無い [model] を無視しました", SCENE_FILE_NAME);
                 false
             }
             _ => true,
         });
-        layout.world_overrides.retain(|o| {
-            if o.node.is_empty() {
-                warn!("{}: name の無い [world_node] を無視しました", SCENE_FILE_NAME);
-            }
-            !o.node.is_empty()
-        });
+        for model in layout.objects.iter_mut().filter_map(|o| o.model_mut()) {
+            model.nodes.retain(|n| {
+                if n.name.is_empty() {
+                    warn!("{}: name の無い [node] を無視しました", SCENE_FILE_NAME);
+                }
+                !n.name.is_empty()
+            });
+        }
         layout
     }
 
@@ -438,20 +468,10 @@ impl SceneLayout {
         let _ = writeln!(text, "# アプリの編集モードで保存すると、この内容は丸ごと書き直されます");
         let _ = writeln!(text, "# 長さはメートル。回転は度で、pitch = X軸まわり、yaw = Y軸まわり、roll = Z軸まわり");
 
-        if let Some(world) = &self.world {
-            let _ = writeln!(text);
-            let _ = writeln!(text, "# Blender などで作ったワールド (path = シーンの中の相対パス、source = 元のファイルの場所)");
-            let _ = writeln!(text, "[world]");
-            let _ = writeln!(text, "path={}", world);
-            if let Some(source) = &self.world_source {
-                let _ = writeln!(text, "source={}", source);
-            }
-        }
-
         let _ = writeln!(text);
-        let _ = writeln!(text, "# のぞき窓 = ディスプレイ面の中心と向き");
-        let _ = writeln!(text, "[window]");
-        write_placement(&mut text, &self.window, false);
+        let _ = writeln!(text, "# スクリーン = 実際のディスプレイの中心と向き");
+        let _ = writeln!(text, "[screen]");
+        write_placement(&mut text, &self.screen, false);
 
         if let Some(size) = self.reference {
             let _ = writeln!(text);
@@ -469,26 +489,22 @@ impl SceneLayout {
         let _ = writeln!(text, "pitch={}", self.light.pitch_deg);
         let _ = writeln!(text, "yaw={}", self.light.yaw_deg);
 
-        for o in &self.world_overrides {
-            let _ = writeln!(text);
-            let _ = writeln!(text, "# ワールドの中のノードの変更 (scale は Blender での大きさに掛ける倍率)");
-            let _ = writeln!(text, "[world_node]");
-            let _ = writeln!(text, "name={}", o.node);
-            if o.hidden {
-                let _ = writeln!(text, "hidden=true");
-            }
-            if let Some(placement) = &o.placement {
-                write_placement(&mut text, placement, true);
-            }
-        }
+        let _ = writeln!(text);
+        let _ = writeln!(text, "# アプリが作る部屋 (床と壁)");
+        let _ = writeln!(text, "[room]");
+        let _ = writeln!(text, "visible={}", self.show_room);
 
         for object in &self.objects {
             let _ = writeln!(text);
             match &object.kind {
-                ObjectKind::Model { path } => {
+                ObjectKind::Model(model) => {
+                    let _ = writeln!(text, "# path = シーンの中の相対パス、source = 元のファイルの場所");
                     let _ = writeln!(text, "[model]");
                     let _ = writeln!(text, "name={}", object.name);
-                    let _ = writeln!(text, "path={}", path);
+                    let _ = writeln!(text, "path={}", model.path);
+                    if let Some(source) = &model.source {
+                        let _ = writeln!(text, "source={}", source);
+                    }
                 }
                 ObjectKind::Cube { color, size } => {
                     let _ = writeln!(text, "[cube]");
@@ -498,6 +514,19 @@ impl SceneLayout {
                 }
             }
             write_placement(&mut text, &object.placement, true);
+
+            for node in object.model().map(|m| m.nodes.as_slice()).unwrap_or_default() {
+                let _ = writeln!(text);
+                let _ = writeln!(text, "# 直前のモデルの中のノードの変更 (scale は Blender での大きさに掛ける倍率)");
+                let _ = writeln!(text, "[node]");
+                let _ = writeln!(text, "name={}", node.name);
+                if node.hidden {
+                    let _ = writeln!(text, "hidden=true");
+                }
+                if let Some(placement) = &node.placement {
+                    write_placement(&mut text, placement, true);
+                }
+            }
         }
         text
     }

@@ -3,8 +3,8 @@ use bevy::{
     prelude::*,
 };
 
-use crate::camera::inset::InsetCamera;
-use crate::camera::main_camera::MainDisplayCamera;
+use crate::camera::camera_preview::MainCameraPreview;
+use crate::camera::main_camera::MainCamera;
 use crate::tracking::tracking::HeadPose;
 
 use crate::config::{AppConfig, DisplayInfo, OFF_AXIS_FAR, OFF_AXIS_NEAR};
@@ -81,8 +81,8 @@ fn update_off_axis_projection(
     config: Res<AppConfig>,
     display: Res<DisplayInfo>,
     layout: Res<SceneLayout>,
-    // 編集モードの小窓のカメラも、覗き込みカメラと同じように動かす
-    mut query: Query<(&mut Transform, &mut Projection), Or<(With<MainDisplayCamera>, With<InsetCamera>)>>,
+    // 編集モードのカメラプレビューも、メインカメラと同じように動かす
+    mut query: Query<(&mut Transform, &mut Projection), Or<(With<MainCamera>, With<MainCameraPreview>)>>,
 ) {
     for (mut transform, mut projection) in &mut query {
         let Projection::Custom(custom) = projection.as_mut() else {
@@ -104,7 +104,7 @@ fn apply_off_axis(
     projection: &mut OffAxisProjection,
 ) {
     // 画面の大きさがシーンを作ったときと違えば、基準の画面の範囲が全部入るように縮尺を変える。
-    // 窓の大きさと目の位置を同じ割合で変えるので、頭を動かしても景色は滑らない
+    // スクリーンの大きさと目の位置を同じ割合で変えるので、頭を動かしても景色は滑らない
     let k = display.view_scale(layout.reference);
 
     // OpenTrack(cm) -> m
@@ -114,10 +114,10 @@ fn apply_off_axis(
     let ez = (config.viewer_base_distance - pose.z * 0.01).max(config.viewer_min_distance) * k;
 
     // 視錐台はディスプレイ基準の座標(ex, ey, ez)で計算し、
-    // カメラ自体はのぞき窓の位置・向きに合わせて置く(カメラの向き = 窓の向き)
-    let window = Transform::from_translation(layout.window.position)
-        .with_rotation(layout.window.rotation());
-    *transform = window * Transform::from_xyz(ex, ey, ez);
+    // カメラ自体はスクリーンの位置・向きに合わせて置く(カメラの向き = スクリーンの向き)
+    let screen = Transform::from_translation(layout.screen.position)
+        .with_rotation(layout.screen.rotation());
+    *transform = screen * Transform::from_xyz(ex, ey, ez);
 
     let n = projection.near;
     let screen_width = display.size.x * k;

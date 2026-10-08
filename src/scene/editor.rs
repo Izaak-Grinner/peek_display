@@ -6,8 +6,8 @@ use crate::scene::layout::{Placement, SceneLayout};
 use crate::scene::library::{self, SceneLibrary};
 use crate::scene::package_store::PackageStore;
 use crate::scene::highlight::SELECTION_COLOR;
+use crate::scene::model::{self, LoadedModels, ModelNode};
 use crate::scene::scene::Placeable;
-use crate::scene::world::{self, WorldInfo, WorldNode};
 use crate::ui::UiInputState;
 
 // キー操作の速さ (Shift を押している間は 1/10)
@@ -18,12 +18,14 @@ const SLOW_FACTOR: f32 = 0.1;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Selection {
-    Window,
+    Screen,
     // シーンの照明 (太陽光と環境光)
     Light,
+    // アプリが作る部屋 (床と壁)
+    Room,
     Object(u64),
-    // ワールドの中のノード (Blender のオブジェクト名)
-    WorldNode(String),
+    // モデルの中のノード (モデルのオブジェクトの id、Blender のオブジェクト名)
+    Node { object: u64, name: String },
 }
 
 // 最後に保存したときの結果
@@ -48,8 +50,6 @@ pub enum Pending {
     Open(String),
     // シーン (.peek) をインポートする
     ImportScene,
-    // ワールド (.glb) をインポートし、新しいシーンとして開く
-    ImportWorld,
 }
 
 // 「名前を付けて保存」ダイアログの入力
@@ -190,11 +190,6 @@ impl EditState {
         }
     }
 
-    // シーンファイルに書き込んだ内容を、保存済みの状態とする (選択などはそのまま)
-    pub fn mark_layout_saved(&mut self, layout: &SceneLayout) {
-        self.saved_layout = layout.clone();
-    }
-
     // 別のシーンに切り替えたとき。その内容を保存済みの状態とし、元に戻す履歴は消す
     pub fn scene_switched(&mut self, layout: &SceneLayout) {
         self.saved_layout = layout.clone();
@@ -207,7 +202,7 @@ impl EditState {
     // 変更を履歴に記録する。idle: マウスもキーも押していない (ドラッグなどが終わった)
     fn track_history(&mut self, layout: &SceneLayout, config: &AppConfig, idle: bool) {
         // 読み込み直後の自動調整は、取り込みと一緒に1回分にする
-        let adjusting = layout.window_from_world || layout.objects.iter().any(|o| o.auto_fit);
+        let adjusting = layout.objects.iter().any(|o| o.place_on_load);
         let Some(settled) = &self.history.settled else {
             self.history.settled = Some(Snapshot::new(layout, config));
             return;
@@ -325,15 +320,18 @@ impl Plugin for EditorPlugin {
     }
 }
 
-// 俯瞰画面でオブジェクトをクリックして選択する。
-// glb の子メッシュに当たった場合も、親をたどって Placeable (ワールドのノードなら WorldNode) を探す
+// シーンビューでオブジェクトをクリックして選択する。
+// glb の子メッシュに当たった場合も、親をたどって Placeable を探す。
+// 選んでいるモデル (またはその中のノード) をもう一度クリックしたときは、中のノード (ModelNode) を選ぶ
+#[allow(clippy::too_many_arguments)]
 fn select_on_click(
     mut click: On<Pointer<Click>>,
     mode: Res<State<AppMode>>,
     ui_input: Res<UiInputState>,
     parents: Query<&ChildOf>,
     placeables: Query<&Placeable>,
-    world_nodes: Query<&WorldNode>,
+    model_nodes: Query<&ModelNode>,
+    models: Res<LoadedModels>,
     mut state: ResMut<EditState>,
 ) {
     if *mode.get() != AppMode::Edit
@@ -344,16 +342,23 @@ fn select_on_click(
     }
 
     let mut entity = click.entity;
+    let mut node = None;
     loop {
         if let Ok(placeable) = placeables.get(entity) {
-            state.selection = Some(Selection::Object(placeable.0));
+            let id = placeable.0;
+            let drill_in = match &state.selection {
+                Some(Selection::Object(selected)) | Some(Selection::Node { object: selected, .. }) => *selected == id,
+                _ => false,
+            } && models.get(id).is_some_and(|info| info.lists_nodes());
+            state.selection = Some(match node {
+                Some(name) if drill_in => Selection::Node { object: id, name },
+                _ => Selection::Object(id),
+            });
             click.propagate(false);
             return;
         }
-        if let Ok(node) = world_nodes.get(entity) {
-            state.selection = Some(Selection::WorldNode(node.0.clone()));
-            click.propagate(false);
-            return;
+        if node.is_none() {
+            node = model_nodes.get(entity).ok().map(|n| n.0.clone());
         }
         match parents.get(entity) {
             Ok(child_of) => entity = child_of.parent(),
@@ -369,7 +374,7 @@ fn keyboard_edit(
     time: Res<Time>,
     ui_input: Res<UiInputState>,
     state: Res<EditState>,
-    world: Res<WorldInfo>,
+    models: Res<LoadedModels>,
     mut layout: ResMut<SceneLayout>,
 ) {
     // Ctrl+S などのショートカットで動かないようにする
@@ -405,10 +410,10 @@ fn keyboard_edit(
     let slow = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
     let dt = time.delta_secs() * if slow { SLOW_FACTOR } else { 1.0 };
 
-    // ワールド座標の軸に沿って動かす (↑ = -Z、→ = +X)
+    // シーンの座標軸に沿って動かす (↑ = -Z、→ = +X)
     let delta = Vec3::new(right, up, -forward) * MOVE_SPEED * dt;
 
-    let apply = |placement: &mut Placement, scalable: bool| {
+    let apply = |placement: &mut Placement, delta: Vec3, scalable: bool| {
         placement.position += delta;
         placement.pitch_deg += turn_x * ROTATE_SPEED * dt;
         placement.yaw_deg += turn_y * ROTATE_SPEED * dt;
@@ -419,7 +424,7 @@ fn keyboard_edit(
     };
 
     match selection {
-        Selection::Window => apply(&mut layout.window, false),
+        Selection::Screen => apply(&mut layout.screen, delta, false),
         // ライトは R/F で傾き、Q/E で方角、+/- で明るさを変える
         Selection::Light => {
             let light = &mut layout.light;
@@ -427,16 +432,26 @@ fn keyboard_edit(
             light.yaw_deg += turn_y * ROTATE_SPEED * dt;
             light.illuminance = (light.illuminance * SCALE_SPEED.powf(grow * dt)).max(0.0);
         }
+        Selection::Room => {}
         Selection::Object(id) => {
             if let Some(object) = layout.object_mut(*id) {
-                apply(&mut object.placement, true);
+                apply(&mut object.placement, delta, true);
             }
         }
-        Selection::WorldNode(name) => {
+        Selection::Node { object, name } => {
+            let (Some(object), Some(info)) = (layout.object_mut(*object), models.get(*object)) else {
+                return;
+            };
+            // ノードの位置はモデルの中の座標なので、シーンの軸に沿った移動を直す
+            let parent = object.placement.clone();
+            let local_delta = parent.rotation().inverse() * delta / parent.scale.max(1e-5);
+            let Some(model) = object.model_mut() else {
+                return;
+            };
             // 初めて動かしたときに、Blender の値から変更として記録する
-            if let Some(mut placement) = world::node_placement(&layout, &world, name) {
-                apply(&mut placement, true);
-                layout.world_override_mut(name).placement = Some(placement);
+            if let Some(mut placement) = model::node_placement(model, info, name) {
+                apply(&mut placement, local_delta, true);
+                model.node_mut(name).placement = Some(placement);
             }
         }
     }
@@ -457,12 +472,12 @@ fn track_history(
     state.bypass_change_detection().track_history(&layout, &config, idle);
 }
 
-// 選択中の対象に目印を描く (ギズモは俯瞰カメラにしか映らない)
+// 選択中の対象に目印を描く (ギズモはシーンビューにしか映らない)
 fn draw_selection(
     mut gizmos: Gizmos,
     state: Res<EditState>,
     layout: Res<SceneLayout>,
-    world: Res<WorldInfo>,
+    models: Res<LoadedModels>,
     globals: Query<&GlobalTransform>,
     placeables: Query<(Entity, &Placeable)>,
 ) {
@@ -474,11 +489,11 @@ fn draw_selection(
         }
     };
     match &state.selection {
-        // のぞき窓の縁取りは preview.rs (枠・視線・目の位置をまとめて縁取る)
-        Some(Selection::Window) => {}
-        // 光の向きを矢印で出す (のぞき窓の少し上から、光が進む向きへ)
+        // スクリーンの縁取りは scene_view.rs (枠・視線・目の位置をまとめて縁取る)
+        Some(Selection::Screen) | Some(Selection::Room) => {}
+        // 光の向きを矢印で出す (スクリーンの少し上から、光が進む向きへ)
         Some(Selection::Light) => {
-            let start = layout.window.position + Vec3::Y * 0.25;
+            let start = layout.screen.position + Vec3::Y * 0.25;
             gizmos.arrow(start, start + layout.light.direction() * 0.25, color);
         }
         Some(Selection::Object(id)) => {
@@ -486,8 +501,8 @@ fn draw_selection(
                 origin(&mut gizmos, entity);
             }
         }
-        Some(Selection::WorldNode(name)) => {
-            if let Some(node) = world.node(name) {
+        Some(Selection::Node { object, name }) => {
+            if let Some(node) = models.get(*object).and_then(|info| info.node(name)) {
                 origin(&mut gizmos, node.entity);
             }
         }
@@ -514,16 +529,16 @@ mod tests {
     fn undo_redo_groups_changes_until_idle() {
         let (mut state, mut layout, mut config) = setup();
         state.track_history(&layout, &config, true);
-        let start = layout.window.position;
+        let start = layout.screen.position;
 
         // 押している間に2回動かす → まだ確定しない
-        layout.window.position.x += 0.1;
+        layout.screen.position.x += 0.1;
         state.track_history(&layout, &config, false);
-        layout.window.position.x += 0.1;
+        layout.screen.position.x += 0.1;
         state.track_history(&layout, &config, false);
         // 離したら1回分として確定
         state.track_history(&layout, &config, true);
-        let moved = layout.window.position;
+        let moved = layout.screen.position;
 
         // 画面サイズの変更も1回分
         config.screen_diagonal_inches += 1.0;
@@ -531,17 +546,17 @@ mod tests {
 
         state.undo(&mut layout, &mut config);
         assert_eq!(config.screen_diagonal_inches, AppConfig::default().screen_diagonal_inches);
-        assert_eq!(layout.window.position, moved);
+        assert_eq!(layout.screen.position, moved);
         state.undo(&mut layout, &mut config);
-        assert_eq!(layout.window.position, start);
+        assert_eq!(layout.screen.position, start);
         assert!(!state.can_undo(&layout, &config));
 
         state.redo(&mut layout, &mut config);
-        assert_eq!(layout.window.position, moved);
+        assert_eq!(layout.screen.position, moved);
         assert!(state.can_redo());
 
         // 新しく変更したら、やり直しの履歴は消える
-        layout.window.position.y += 0.2;
+        layout.screen.position.y += 0.2;
         state.track_history(&layout, &config, true);
         assert!(!state.can_redo());
     }
@@ -563,11 +578,11 @@ mod tests {
     fn undo_commits_pending_change_first() {
         let (mut state, mut layout, mut config) = setup();
         state.track_history(&layout, &config, true);
-        let start = layout.window.position;
-        layout.window.position.z -= 0.3;
+        let start = layout.screen.position;
+        layout.screen.position.z -= 0.3;
         state.track_history(&layout, &config, false);
         assert!(state.can_undo(&layout, &config));
         state.undo(&mut layout, &mut config);
-        assert_eq!(layout.window.position, start);
+        assert_eq!(layout.screen.position, start);
     }
 }

@@ -1,5 +1,5 @@
-// 開いているシーン (.peek) の中のファイル (ワールド・モデル) を、メモリ上に置いて Bevy から読み込ませる。
-// 読み込むときのパスは peek://<番号>/<シーンの中の相対パス>。
+// 開いているシーン (.peek) の中のファイル (モデル) を、メモリ上に置いて Bevy から読み込ませる。
+// 読み込むときのパスは scene://<番号>/<シーンの中の相対パス>。
 // シーンを開き直すたびに番号を変え、同じ相対パスでも前に開いたシーンの読み込み済みデータと混ざらないようにする
 use bevy::{
     asset::io::{
@@ -11,8 +11,8 @@ use bevy::{
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-// アセットの読み込み元の名前 (peek://...)
-const SOURCE: &str = "peek";
+// アセットの読み込み元の名前 (scene://...)
+const SOURCE: &str = "scene";
 
 #[derive(Resource)]
 pub struct PackageStore {

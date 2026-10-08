@@ -4,6 +4,6 @@ pub mod layout;
 pub mod scene;
 pub mod package;
 pub mod library;
-pub mod world;
+pub mod model;
 pub mod highlight;
 pub mod package_store;

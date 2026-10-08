@@ -6,15 +6,15 @@ use bevy_egui::{
 
 use super::widgets::{self, Button, Icon, NumberField, color::*};
 use crate::app_mode::{AppMode, EditViewInsets};
-use crate::camera::inset::MainCameraInset;
+use crate::camera::camera_preview::CameraPreview;
 use crate::config::{ARUCO_MARKER_SIZE_CM, AppConfig, DisplayInfo};
 use crate::scene::editor::{EditState, Pending, SaveAsDialog, SaveStatus, Selection};
-use crate::scene::import::{ImportKind, ImportState};
+use crate::scene::import::ImportState;
 use crate::scene::layout::{ObjectKind, Placement, SceneLayout, SceneObject};
 use crate::scene::library::{self, SceneLibrary};
 use crate::scene::package::{PackageFiles, PackageMessage, PackageState};
 use crate::scene::package_store::PackageStore;
-use crate::scene::world::{self, WorldInfo, WorldNodeInfo};
+use crate::scene::model::{self, LoadedModels, ModelInfo, NodeInfo, ReloadRequest};
 
 const PANEL_WIDTH: f32 = 330.0;
 const MENU_BAR_HEIGHT: f32 = 28.0;
@@ -22,18 +22,18 @@ const MENU_BAR_HEIGHT: f32 = 28.0;
 // 新規シーンを名前を付けて保存するときの名前の初期値
 const NEW_SCENE_NAME: &str = "新しいシーン";
 
-// 覗き込みカメラの小窓の大きさ。俯瞰ビューの幅に対する割合と上下限、高さの上限 (俯瞰ビューに対する割合)
-const INSET_WIDTH_RATIO: f32 = 0.3;
-const INSET_WIDTH_RANGE: (f32, f32) = (200.0, 480.0);
-const INSET_MAX_HEIGHT_RATIO: f32 = 0.45;
-const INSET_MARGIN: f32 = 12.0;
+// カメラプレビューの大きさ。シーンビューの幅に対する割合と上下限、高さの上限 (シーンビューに対する割合)
+const PREVIEW_WIDTH_RATIO: f32 = 0.3;
+const PREVIEW_WIDTH_RANGE: (f32, f32) = (200.0, 480.0);
+const PREVIEW_MAX_HEIGHT_RATIO: f32 = 0.45;
+const PREVIEW_MARGIN: f32 = 12.0;
 
 // 複製したオブジェクトをずらす量(メートル)
 const DUPLICATE_OFFSET: Vec3 = Vec3::new(0.05, 0.0, 0.0);
 
 // 編集モードの操作方法。メニューの「ヘルプ → 操作方法」にまとめて出す
 const HELP_ROWS: [(&str, &str); 19] = [
-    ("左クリック", "オブジェクトを選択(一覧か3Dビュー。壁や床で選択を外す)"),
+    ("左クリック", "オブジェクトを選択(一覧かシーンビュー。選んだモデルをもう一度クリックすると中のオブジェクトを選択。壁や床で選択を外す)"),
     ("右ドラッグ / ホイール", "視点の回転 / ズーム"),
     ("ホイールを押しながらドラッグ", "視点の平行移動"),
     ("矢印キー", "移動(↑↓ = Z軸、←→ = X軸)"),
@@ -45,13 +45,13 @@ const HELP_ROWS: [(&str, &str); 19] = [
     ("Shift を押しながら", "ゆっくり動かす(速さ1/10)"),
     ("Ctrl+Z / Ctrl+Shift+Z", "元に戻す / やり直し (Ctrl+Y でもやり直し)"),
     ("Ctrl+D", "選択中のオブジェクトを複製"),
-    ("Delete", "選択中のオブジェクトを削除(ワールドのものは非表示に切り替え)"),
+    ("Delete", "選択中のオブジェクトを削除(モデルの中のオブジェクトは非表示に切り替え)"),
     ("Ctrl+N", "新規シーン"),
     ("Ctrl+S / Ctrl+Shift+S", "保存 / 名前を付けて保存"),
     ("Esc", "ホームへ戻る / ダイアログを閉じる"),
     ("Enter", "ダイアログで決定"),
     ("数値欄", "ドラッグで増減、クリックで入力"),
-    ("メニュー", "シーンを開く・ワールドの取り込み・インポート・エクスポートは「ファイル」から"),
+    ("メニュー", "シーンを開く・インポート・エクスポートは「ファイル」から"),
 ];
 
 // パネルの見た目だけに関わる状態 (保存しない)
@@ -78,16 +78,19 @@ enum Action {
     Redo,
     ExportScene,
     ImportModel,
-    ReloadWorld,
+    // モデルを元のファイルから読み直す
+    ReloadModel(u64),
     OpenScenesFolder,
-    // ワールドのノードの表示・非表示を切り替える
-    ToggleHidden(String),
-    // ワールドのノードを Blender の値に戻す
-    ResetWorldNode(String),
-    // のぞき窓を Blender の peek_window の位置に戻す
-    ResetWindow,
+    // モデルの中のノードの表示・非表示を切り替える
+    ToggleNodeHidden(u64, String),
+    // モデルの中のノードを Blender の値に戻す
+    ResetNode(u64, String),
+    // スクリーンを、モデルの中の screen カメラの位置に合わせる
+    FitScreen,
     // ライトを初期値に戻す
     ResetLight,
+    // 部屋の表示・非表示を切り替える
+    ToggleRoom,
     // 今の画面を、シーンの基準の画面にする
     SetReference,
     // 保存してあるシーンの削除 (確認ダイアログを出す → 削除する / やめる)
@@ -110,14 +113,15 @@ pub fn edit_panel(
     mut import: ResMut<ImportState>,
     mut package: ResMut<PackageState>,
     mut store: ResMut<PackageStore>,
-    mut world: ResMut<WorldInfo>,
+    models: Res<LoadedModels>,
+    mut reload: ResMut<ReloadRequest>,
     display: Res<DisplayInfo>,
     mut insets: ResMut<EditViewInsets>,
     mut next: ResMut<NextState<AppMode>>,
     mut panel: Local<PanelUi>,
-    mut inset: ResMut<MainCameraInset>,
+    mut preview: ResMut<CameraPreview>,
 ) -> Result {
-    let inset_texture = contexts.add_image(EguiTextureHandle::Weak(inset.image.id()));
+    let preview_texture = contexts.add_image(EguiTextureHandle::Weak(preview.image.id()));
     let ctx = contexts.ctx_mut()?;
 
     // 値を書き換えたときだけ変更扱いにする (毎フレーム変更扱いにすると、シーンの同期が毎回走る)
@@ -140,7 +144,7 @@ pub fn edit_panel(
             .show_separator_line(false)
             .frame(egui::Frame::new().fill(BAR).inner_margin(Margin::symmetric(6, 0)))
             .show(ctx, |ui| {
-                menu_bar(ui, layout, config, state, library, &import, &package, &mut inset, &mut panel, dirty, &mut action)
+                menu_bar(ui, layout, config, state, library, &import, &package, &mut preview, &mut panel, dirty, &mut action)
             });
         let menu_rect = menu.response.rect;
         ctx.layer_painter(egui::LayerId::background())
@@ -166,10 +170,10 @@ pub fn edit_panel(
                         egui::ScrollArea::vertical()
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                scene_section(ui, layout, state, &import, &package, &world, &mut action);
+                                scene_section(ui, layout, state, &import, &package, &models, &mut action);
                                 ui.add_space(4.0);
                                 widgets::section_header(ui, "プロパティ", None, |_| {});
-                                properties(ui, layout, config, state, &world, &display, &mut *panel, &mut action);
+                                properties(ui, layout, config, state, &models, &display, &mut *panel, &mut action);
                             });
                     });
             });
@@ -179,7 +183,7 @@ pub fn edit_panel(
         insets.right = rect.width();
         insets.top = menu_rect.height();
 
-        viewport_overlay(ctx, &mut inset, inset_texture, (display.size.x, display.size.y), &insets);
+        viewport_overlay(ctx, &mut preview, preview_texture, (display.size.x, display.size.y), &insets);
         help_window(ctx, &mut panel.help_open);
 
         if let Some(id) = state.confirm_delete {
@@ -241,9 +245,9 @@ pub fn edit_panel(
                     } else if keyboard.just_pressed(KeyCode::Delete) {
                         action = Some(Action::AskDelete(id));
                     }
-                } else if let Some(Selection::WorldNode(name)) = &state.selection {
+                } else if let Some(Selection::Node { object, name }) = &state.selection {
                     if keyboard.just_pressed(KeyCode::Delete) {
-                        action = Some(Action::ToggleHidden(name.clone()));
+                        action = Some(Action::ToggleNodeHidden(*object, name.clone()));
                     }
                 }
             }
@@ -287,27 +291,32 @@ pub fn edit_panel(
             }
             Some(Action::ImportModel) => {
                 files.state.import_error = None;
-                files.import.start(ImportKind::Model);
+                files.import.start();
             }
-            Some(Action::ReloadWorld) => world.reload_requested = true,
+            Some(Action::ReloadModel(id)) => reload.0 = Some(id),
             Some(Action::OpenScenesFolder) => open_scenes_folder(),
-            Some(Action::ToggleHidden(name)) => {
-                let o = files.layout.world_override_mut(&name);
-                o.hidden = !o.hidden;
-                files.layout.prune_world_overrides();
+            Some(Action::ToggleNodeHidden(id, name)) => {
+                if let Some(model) = files.layout.object_mut(id).and_then(|o| o.model_mut()) {
+                    let node = model.node_mut(&name);
+                    node.hidden = !node.hidden;
+                    model.prune_nodes();
+                }
             }
-            Some(Action::ResetWorldNode(name)) => {
-                files.layout.world_override_mut(&name).placement = None;
-                files.layout.prune_world_overrides();
+            Some(Action::ResetNode(id, name)) => {
+                if let Some(model) = files.layout.object_mut(id).and_then(|o| o.model_mut()) {
+                    model.node_mut(&name).placement = None;
+                    model.prune_nodes();
+                }
             }
             Some(Action::ResetLight) => files.layout.light = Default::default(),
+            Some(Action::ToggleRoom) => files.layout.show_room = !files.layout.show_room,
             Some(Action::SetReference) => files.layout.reference = Some(files.display.size),
             Some(Action::AskDeleteScene(name)) => files.state.confirm_delete_scene = Some(name),
             Some(Action::DeleteScene(name)) => files.delete_scene(&name),
             Some(Action::CancelDeleteScene) => files.state.confirm_delete_scene = None,
-            Some(Action::ResetWindow) => {
-                if let Some(window) = world.window.clone() {
-                    files.layout.window = window;
+            Some(Action::FitScreen) => {
+                if let Some(placement) = models.screen_placement(files.layout).map(|(_, p)| p) {
+                    files.layout.screen = placement;
                 }
             }
             Some(Action::Duplicate(id)) => {
@@ -324,7 +333,11 @@ pub fn edit_panel(
             Some(Action::AskDelete(id)) => files.state.confirm_delete = Some(id),
             Some(Action::Delete(id)) => {
                 files.layout.objects.retain(|o| o.id != id);
-                if files.state.selection == Some(Selection::Object(id)) {
+                let selected = match &files.state.selection {
+                    Some(Selection::Object(s)) | Some(Selection::Node { object: s, .. }) => *s == id,
+                    _ => false,
+                };
+                if selected {
                     files.state.selection = None;
                 }
                 files.state.confirm_delete = None;
@@ -394,10 +407,6 @@ impl FileContext<'_> {
                 }
             },
             Pending::ImportScene => self.package.start_import(),
-            Pending::ImportWorld => {
-                self.state.import_error = None;
-                self.import.start(ImportKind::World);
-            }
         }
     }
 
@@ -487,7 +496,7 @@ fn menu_bar(
     library: &SceneLibrary,
     import: &ImportState,
     package: &PackageState,
-    inset: &mut MainCameraInset,
+    preview: &mut CameraPreview,
     panel: &mut PanelUi,
     dirty: bool,
     action: &mut Option<Action>,
@@ -550,14 +559,11 @@ fn menu_bar(
             ui.separator();
             ui.menu_button("インポート", |ui| {
                 ui.set_min_width(220.0);
-                if ui.add_enabled(!import.busy(), egui::Button::new("ワールド (.glb)…")).clicked() {
-                    set(Action::Request(Pending::ImportWorld));
+                if ui.add_enabled(!import.busy(), egui::Button::new("モデル (.glb / .gltf)…")).clicked() {
+                    set(Action::ImportModel);
                 }
                 if ui.add_enabled(!package.busy(), egui::Button::new("シーン (.peek)…")).clicked() {
                     set(Action::Request(Pending::ImportScene));
-                }
-                if ui.add_enabled(!import.busy(), egui::Button::new("モデル (.glb / .gltf)…")).clicked() {
-                    set(Action::ImportModel);
                 }
             });
             ui.menu_button("エクスポート", |ui| {
@@ -566,11 +572,6 @@ fn menu_bar(
                     set(Action::ExportScene);
                 }
             });
-            // 元のファイルの場所が分かるワールドだけ (共有を受けたシーンなどでは押せない)
-            let can_reload = layout.world.is_some() && layout.world_source.as_deref().is_some_and(|s| std::path::Path::new(s).is_file());
-            if ui.add_enabled(can_reload, egui::Button::new("ワールドを再読み込み")).clicked() {
-                set(Action::ReloadWorld);
-            }
         });
 
         ui.menu_button("編集", |ui| {
@@ -585,7 +586,7 @@ fn menu_bar(
 
         ui.menu_button("表示", |ui| {
             ui.set_min_width(180.0);
-            ui.checkbox(&mut inset.visible, "覗き込みカメラの小窓");
+            ui.checkbox(&mut preview.visible, "カメラプレビュー");
         });
 
         ui.menu_button("ヘルプ", |ui| {
@@ -610,14 +611,14 @@ fn menu_bar(
 
 fn kind_label(kind: &ObjectKind) -> &'static str {
     match kind {
-        ObjectKind::Model { .. } => "モデル",
+        ObjectKind::Model(_) => "モデル",
         ObjectKind::Cube { .. } => "キューブ",
     }
 }
 
 fn kind_icon(kind: &ObjectKind) -> (Icon, Color32) {
     match kind {
-        ObjectKind::Model { .. } => (Icon::Model, ICON_MODEL),
+        ObjectKind::Model(_) => (Icon::Model, ICON_MODEL),
         ObjectKind::Cube { .. } => (Icon::Cube, ICON_CUBE),
     }
 }
@@ -625,12 +626,12 @@ fn kind_icon(kind: &ObjectKind) -> (Icon, Color32) {
 // 3D ビュー左上の表示 (クリックは 3D 側に通す)
 fn viewport_overlay(
     ctx: &egui::Context,
-    inset: &mut ResMut<MainCameraInset>,
+    preview: &mut ResMut<CameraPreview>,
     texture: egui::TextureId,
     (screen_width, screen_height): (f32, f32),
     insets: &EditViewInsets,
 ) {
-    // 俯瞰ビューの範囲 (メニューバーと右のパネルを除く)
+    // シーンビューの範囲 (メニューバーと右のパネルを除く)
     let screen = ctx.content_rect();
     let view = egui::Rect::from_min_max(
         screen.min + vec2(0.0, insets.top),
@@ -643,32 +644,32 @@ fn viewport_overlay(
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                overlay_chip(ui, "俯瞰ビュー", 12.0, TEXT);
+                overlay_chip(ui, "シーンビュー", 12.0, TEXT);
             });
         });
 
-    if !inset.visible {
+    if !preview.visible {
         return;
     }
 
-    // 覗き込みカメラの小窓 (俯瞰ビューの右下)。映像は InsetCamera が画像に描いたもの
+    // カメラプレビュー (シーンビューの右下)。映像は MainCameraPreview が画像に描いたもの
     let aspect = screen_width / screen_height;
-    let mut width = (view.width() * INSET_WIDTH_RATIO)
-        .clamp(INSET_WIDTH_RANGE.0, INSET_WIDTH_RANGE.1)
-        .min(view.width() - INSET_MARGIN * 2.0);
-    let max_height = view.height() * INSET_MAX_HEIGHT_RATIO;
+    let mut width = (view.width() * PREVIEW_WIDTH_RATIO)
+        .clamp(PREVIEW_WIDTH_RANGE.0, PREVIEW_WIDTH_RANGE.1)
+        .min(view.width() - PREVIEW_MARGIN * 2.0);
+    let max_height = view.height() * PREVIEW_MAX_HEIGHT_RATIO;
     if width / aspect > max_height {
         width = max_height * aspect;
     }
     let size = vec2(width, width / aspect).max(egui::Vec2::splat(1.0));
     let image_size = (size * ctx.pixels_per_point()).round();
     let image_size = UVec2::new(image_size.x as u32, image_size.y as u32);
-    if inset.size != image_size {
-        inset.size = image_size;
+    if preview.size != image_size {
+        preview.size = image_size;
     }
 
-    egui::Area::new(egui::Id::new("main_camera_inset"))
-        .fixed_pos(view.right_bottom() - size - egui::Vec2::splat(INSET_MARGIN))
+    egui::Area::new(egui::Id::new("camera_preview"))
+        .fixed_pos(view.right_bottom() - size - egui::Vec2::splat(PREVIEW_MARGIN))
         .show(ctx, |ui| {
             let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
             let painter = ui.painter();
@@ -681,10 +682,10 @@ fn viewport_overlay(
             painter.rect_stroke(
                 rect.expand(1.0),
                 CornerRadius::same(2),
-                widgets::hairline(ICON_WINDOW.gamma_multiply(0.7)),
+                widgets::hairline(ICON_SCREEN.gamma_multiply(0.7)),
                 egui::StrokeKind::Inside,
             );
-            let galley = widgets::text(ui, "覗き込みカメラ", 11.0, TEXT);
+            let galley = widgets::text(ui, "メインカメラ", 11.0, TEXT);
             let chip = egui::Rect::from_min_size(rect.min + vec2(6.0, 6.0), vec2(galley.size().x + 16.0, 22.0));
             painter.rect(
                 chip,
@@ -773,10 +774,10 @@ fn scene_section(
     state: &mut EditState,
     import: &ImportState,
     package: &PackageState,
-    world: &WorldInfo,
+    models: &LoadedModels,
     action: &mut Option<Action>,
 ) {
-    let count = (layout.objects.len() + world.nodes.len() + 2).to_string();
+    let count = (layout.objects.len() + 3).to_string();
     widgets::section_header(ui, "シーン", Some(count), |_| {});
     package_status(ui, package);
 
@@ -793,7 +794,7 @@ fn scene_section(
                         .id_salt("scene_list")
                         .max_height(196.0)
                         .auto_shrink([false, false])
-                        .show(ui, |ui| scene_list(ui, layout, state, import, world, action))
+                        .show(ui, |ui| scene_list(ui, layout, state, import, models, action))
                 });
         });
 }
@@ -852,41 +853,33 @@ fn scene_list(
     layout: &SceneLayout,
     state: &mut EditState,
     import: &ImportState,
-    world: &WorldInfo,
+    models: &LoadedModels,
     action: &mut Option<Action>,
 ) {
-    widgets::group_label(ui, "覗き込みカメラ", 4.0);
-    let selected = state.selection == Some(Selection::Window);
-    if widgets::list_row(ui, selected, Icon::Monitor, ICON_WINDOW, "のぞき窓", "カメラ").clicked() {
-        state.selection = Some(Selection::Window);
+    widgets::group_label(ui, "メインカメラ", 4.0);
+    let selected = state.selection == Some(Selection::Screen);
+    if widgets::list_row(ui, selected, Icon::Monitor, ICON_SCREEN, "スクリーン", "実際の画面").clicked() {
+        state.selection = Some(Selection::Screen);
     }
 
-    widgets::group_label(ui, "照明", 8.0);
+    widgets::group_label(ui, "環境", 8.0);
     let selected = state.selection == Some(Selection::Light);
     if widgets::list_row(ui, selected, Icon::Sun, ICON_LIGHT, "ライト", "太陽光・環境光").clicked() {
         state.selection = Some(Selection::Light);
     }
-
-    if let Some(path) = &layout.world {
-        widgets::group_label(ui, "ワールド", 8.0);
-        if !world.ready {
-            let file = path.rsplit('/').next().unwrap_or(path);
-            ui.label(RichText::new(format!("{} を読み込み中…", file)).size(11.0).color(TEXT_HINT));
-        }
-        for node in &world.nodes {
-            let selected = state.selection.as_ref() == Some(&Selection::WorldNode(node.name.clone()));
-            let tag = if world::node_hidden(layout, &node.name) { "非表示" } else { "ワールド" };
-            if widgets::list_row(ui, selected, Icon::Model, ICON_MODEL, &node.name, tag).clicked() {
-                state.selection = Some(Selection::WorldNode(node.name.clone()));
-            }
-        }
+    let selected = state.selection == Some(Selection::Room);
+    let tag = if layout.show_room { "床と壁" } else { "非表示" };
+    if widgets::list_row(ui, selected, Icon::Cube, ICON_CUBE, "部屋", tag).clicked() {
+        state.selection = Some(Selection::Room);
     }
 
     widgets::group_label(ui, "オブジェクト", 8.0);
     let busy = import.busy();
     let label = if busy { "ファイルを選択中…" } else { "モデルを追加…" };
-    let add = widgets::add_row(ui, label, ".glb / .gltf", busy)
-        .on_hover_text("のぞき窓の正面・床の上に、約30cmの大きさで置かれます");
+    let add = widgets::add_row(ui, label, ".glb / .gltf", busy).on_hover_text(format!(
+        "スクリーンの正面・床の上に、約30cmの大きさで置かれます ({} カメラの入ったモデルは、Blender の位置と大きさのまま置かれます)",
+        model::SCREEN_NODE
+    ));
     if add.clicked() {
         *action = Some(Action::ImportModel);
     }
@@ -908,6 +901,26 @@ fn scene_list(
         let (icon, icon_color) = kind_icon(&object.kind);
         if widgets::list_row(ui, selected, icon, icon_color, &object.name, kind_label(&object.kind)).clicked() {
             state.selection = Some(Selection::Object(object.id));
+        }
+
+        // 選んでいるモデルは、中のノードも並べる
+        let (Some(model), Some(info)) = (object.model(), models.get(object.id)) else {
+            continue;
+        };
+        let open = match &state.selection {
+            Some(Selection::Object(id)) | Some(Selection::Node { object: id, .. }) => *id == object.id,
+            _ => false,
+        };
+        if !open || !info.lists_nodes() {
+            continue;
+        }
+        for node in &info.nodes {
+            let row = Selection::Node { object: object.id, name: node.name.clone() };
+            let selected = state.selection.as_ref() == Some(&row);
+            let tag = if model::node_hidden(model, &node.name) { "非表示" } else { "" };
+            if widgets::child_row(ui, selected, Icon::Model, ICON_MODEL, &node.name, tag).clicked() {
+                state.selection = Some(row);
+            }
         }
     }
 }
@@ -947,7 +960,7 @@ fn properties(
     layout: &mut SceneLayout,
     config: &mut AppConfig,
     state: &mut EditState,
-    world: &WorldInfo,
+    models: &LoadedModels,
     display: &DisplayInfo,
     panel: &mut PanelUi,
     action: &mut Option<Action>,
@@ -955,14 +968,17 @@ fn properties(
     egui::Frame::new().inner_margin(10).show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 10.0;
         match state.selection.clone() {
-            Some(Selection::Window) => window_properties(ui, layout, config, world, display, panel, action),
-            Some(Selection::Light) => light_properties(ui, layout, world, action),
-            Some(Selection::WorldNode(name)) => match world.node(&name) {
-                Some(node) => world_node_properties(ui, layout, world, node, action),
-                None => nothing_selected(ui, state),
-            },
+            Some(Selection::Screen) => screen_properties(ui, layout, config, models, display, panel, action),
+            Some(Selection::Light) => light_properties(ui, layout, models, action),
+            Some(Selection::Room) => room_properties(ui, layout, action),
+            Some(Selection::Node { object, name }) => {
+                match models.get(object).and_then(|info| Some((info, info.node(&name)?))) {
+                    Some((info, node)) => node_properties(ui, layout, object, info, node, action),
+                    None => nothing_selected(ui, state),
+                }
+            }
             Some(Selection::Object(id)) => match layout.object_mut(id) {
-                Some(object) => object_properties(ui, object, action),
+                Some(object) => object_properties(ui, object, models.get(id), action),
                 None => nothing_selected(ui, state),
             },
             None => nothing_selected(ui, state),
@@ -977,28 +993,28 @@ fn nothing_selected(ui: &mut Ui, state: &mut EditState) {
         widgets::icon(ui, Icon::Cursor, 28.0, Color32::from_gray(0x6b), 1.0);
         ui.label(RichText::new("何も選択されていません").size(13.0).color(Color32::from_gray(0xd0)));
         ui.add_space(8.0);
-        let open = Button::new("のぞき窓・画面の設定を開く", widgets::BUTTON)
-            .colored_icon(Icon::Monitor, ICON_WINDOW)
+        let open = Button::new("スクリーン・画面の設定を開く", widgets::BUTTON)
+            .colored_icon(Icon::Monitor, ICON_SCREEN)
             .width(ui.available_width())
             .height(30.0)
             .show(ui);
         if open.clicked() {
-            state.selection = Some(Selection::Window);
+            state.selection = Some(Selection::Screen);
         }
         ui.add_space(14.0);
     });
 }
 
 // シーンの照明 (アプリの太陽光と環境光)
-fn light_properties(ui: &mut Ui, layout: &mut SceneLayout, world: &WorldInfo, action: &mut Option<Action>) {
+fn light_properties(ui: &mut Ui, layout: &mut SceneLayout, models: &LoadedModels, action: &mut Option<Action>) {
     const LABEL: f32 = 72.0;
     identity(ui, Icon::Sun, ICON_LIGHT, |ui| {
         ui.label(RichText::new("ライト").size(13.0).color(TEXT_STRONG));
         ui.label(RichText::new("太陽光の明るさと向き、環境光").size(10.5).color(TEXT_MUTED));
     });
 
-    // ワールドのライトを使っていて、アプリの太陽光は消えているか
-    let sun_off = layout.world.is_some() && world.has_lights;
+    // モデルのライトを使っていて、アプリの太陽光は消えているか
+    let sun_off = models.has_lights(layout);
     let light = &mut layout.light;
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing = vec2(4.0, 6.0);
@@ -1030,7 +1046,7 @@ fn light_properties(ui: &mut Ui, layout: &mut SceneLayout, world: &WorldInfo, ac
         if sun_off {
             widgets::wrapped_label(
                 ui,
-                "ワールドにライトがあるため、この太陽光は消えています（環境光は効きます）。",
+                "モデルにライトが入っているため、この太陽光は消えています（環境光は効きます）。",
                 10.5,
                 Color32::from_rgb(0xf0, 0xb0, 0x5a),
             );
@@ -1057,21 +1073,50 @@ fn light_properties(ui: &mut Ui, layout: &mut SceneLayout, world: &WorldInfo, ac
     }
 }
 
-// ワールドのノード。触っていなければ Blender の値を出し、値を変えたら変更として記録する
-fn world_node_properties(
+// アプリが作る部屋 (床と壁)
+fn room_properties(ui: &mut Ui, layout: &SceneLayout, action: &mut Option<Action>) {
+    identity(ui, Icon::Cube, ICON_CUBE, |ui| {
+        ui.label(RichText::new("部屋").size(13.0).color(TEXT_STRONG));
+        ui.label(RichText::new("アプリが置く床（チェッカー模様）と壁").size(10.5).color(TEXT_MUTED));
+    });
+    let label = if layout.show_room { "非表示にする" } else { "表示する" };
+    if Button::new(label, widgets::BUTTON).width(ui.available_width()).show(ui).clicked() {
+        *action = Some(Action::ToggleRoom);
+    }
+    widgets::wrapped_label(
+        ui,
+        &format!(
+            "Blender で作った部屋を使うときは非表示にします。{} カメラの入ったモデルをインポートすると、自動で非表示になります。",
+            model::SCREEN_NODE
+        ),
+        10.5,
+        TEXT_HINT,
+    );
+}
+
+// モデルの中のノード。触っていなければ Blender の値を出し、値を変えたら変更として記録する
+fn node_properties(
     ui: &mut Ui,
     layout: &mut SceneLayout,
-    world: &WorldInfo,
-    node: &WorldNodeInfo,
+    object_id: u64,
+    info: &ModelInfo,
+    node: &NodeInfo,
     action: &mut Option<Action>,
 ) {
-    let hidden = world::node_hidden(layout, &node.name);
-    let changed = layout.world_override(&node.name).is_some_and(|o| o.placement.is_some());
+    let Some(object) = layout.object_mut(object_id) else {
+        return;
+    };
+    let object_name = object.name.clone();
+    let Some(model) = object.model_mut() else {
+        return;
+    };
+    let hidden = model::node_hidden(model, &node.name);
+    let changed = model.node(&node.name).is_some_and(|n| n.placement.is_some());
     identity(ui, Icon::Model, ICON_MODEL, |ui| {
         ui.label(RichText::new(&node.name).size(13.0).color(TEXT_STRONG));
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            kind_chip(ui, "ワールド", ICON_MODEL);
+            kind_chip(ui, &format!("{} の中", object_name), ICON_MODEL);
             let note = match (changed, hidden) {
                 (_, true) => "非表示",
                 (true, false) => "アプリで変更",
@@ -1081,22 +1126,27 @@ fn world_node_properties(
         });
     });
 
-    let Some(before) = world::node_placement(layout, world, &node.name) else {
+    let Some(before) = model::node_placement(model, info, &node.name) else {
         return;
     };
     let mut placement = before.clone();
     placement_editor(ui, &mut placement, true);
     if placement != before {
-        layout.world_override_mut(&node.name).placement = Some(placement);
+        model.node_mut(&node.name).placement = Some(placement);
     }
-    widgets::wrapped_label(ui, "大きさは Blender での大きさに掛ける倍率です。", 10.5, TEXT_HINT);
+    widgets::wrapped_label(
+        ui,
+        "位置と回転はモデルの中の座標です。大きさは Blender での大きさに掛ける倍率です。",
+        10.5,
+        TEXT_HINT,
+    );
 
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         let width = (ui.available_width() - 6.0) / 2.0;
         let label = if hidden { "表示する" } else { "非表示にする" };
         if Button::new(label, widgets::BUTTON).width(width).show(ui).clicked() {
-            *action = Some(Action::ToggleHidden(node.name.clone()));
+            *action = Some(Action::ToggleNodeHidden(object_id, node.name.clone()));
         }
         if Button::new("Blender の値に戻す", widgets::BUTTON)
             .width(width)
@@ -1104,17 +1154,14 @@ fn world_node_properties(
             .show(ui)
             .clicked()
         {
-            *action = Some(Action::ResetWorldNode(node.name.clone()));
+            *action = Some(Action::ResetNode(object_id, node.name.clone()));
         }
     });
 }
 
-fn object_properties(ui: &mut Ui, object: &mut SceneObject, action: &mut Option<Action>) {
+fn object_properties(ui: &mut Ui, object: &mut SceneObject, info: Option<&ModelInfo>, action: &mut Option<Action>) {
     let (icon, icon_color) = kind_icon(&object.kind);
-    let detail = match &object.kind {
-        ObjectKind::Model { path } => Some(path.clone()),
-        ObjectKind::Cube { .. } => None,
-    };
+    let detail = object.model().map(|m| m.path.clone());
     identity(ui, icon, icon_color, |ui| {
         name_edit(ui, &mut object.name, object.id);
         ui.horizontal(|ui| {
@@ -1147,6 +1194,35 @@ fn object_properties(ui: &mut Ui, object: &mut SceneObject, action: &mut Option<
             *action = Some(Action::AskDelete(object.id));
         }
     });
+
+    let Some(model) = object.model() else {
+        return;
+    };
+    if info.is_some_and(|info| info.lists_nodes()) {
+        widgets::wrapped_label(
+            ui,
+            "中のオブジェクトは、一覧で選ぶか、シーンビューでもう一度クリックすると個別に動かせます。",
+            10.5,
+            TEXT_HINT,
+        );
+    }
+    // 元のファイルの場所が分かるモデルだけ (共有を受けたシーンなどでは押せない)
+    let can_reload = model.source.as_deref().is_some_and(|s| std::path::Path::new(s).is_file());
+    let hint = match &model.source {
+        Some(source) if can_reload => format!("{} から読み直します (Blender で書き出し直したとき)", source),
+        Some(source) => format!("元のファイル {} が見つかりません", source),
+        None => "元のファイルの場所が分かりません".to_string(),
+    };
+    if Button::new("元のファイルから再読み込み", widgets::BUTTON)
+        .width(ui.available_width())
+        .enabled(can_reload)
+        .show(ui)
+        .on_hover_text(&hint)
+        .on_disabled_hover_text(hint)
+        .clicked()
+    {
+        *action = Some(Action::ReloadModel(object.id));
+    }
 }
 
 // 選択中のものの見出し: 左に大きめのアイコン、右に名前など
@@ -1272,11 +1348,11 @@ fn row_label(ui: &mut Ui, width: f32, label: &str, unit: &str) {
     }
 }
 
-fn window_properties(
+fn screen_properties(
     ui: &mut Ui,
     layout: &mut SceneLayout,
     config: &mut AppConfig,
-    world: &WorldInfo,
+    models: &LoadedModels,
     display: &DisplayInfo,
     panel: &mut PanelUi,
     action: &mut Option<Action>,
@@ -1284,28 +1360,20 @@ fn window_properties(
     const LABEL: f32 = 72.0;
     const GAP: f32 = 4.0;
 
-    identity(ui, Icon::Monitor, ICON_WINDOW, |ui| {
-        ui.label(RichText::new("のぞき窓").size(13.0).color(TEXT_STRONG));
+    identity(ui, Icon::Monitor, ICON_SCREEN, |ui| {
+        ui.label(RichText::new("スクリーン").size(13.0).color(TEXT_STRONG));
         ui.label(RichText::new("実際のディスプレイの位置と大きさ").size(10.5).color(TEXT_MUTED));
     });
 
-    placement_editor(ui, &mut layout.window, false);
-    if layout.world.is_some() {
-        let can_reset = world.window.is_some();
-        let reset = Button::new("Blender の位置に戻す", widgets::BUTTON)
+    placement_editor(ui, &mut layout.screen, false);
+    // モデルに screen カメラがあれば、その位置に合わせられる
+    if let Some((name, placement)) = models.screen_placement(layout) {
+        let fit = Button::new(&format!("「{}」の {} カメラに合わせる", name, model::SCREEN_NODE), widgets::BUTTON)
             .width(ui.available_width())
-            .enabled(can_reset)
+            .enabled(placement != layout.screen)
             .show(ui);
-        if reset.clicked() {
-            *action = Some(Action::ResetWindow);
-        }
-        if !can_reset && world.ready {
-            widgets::wrapped_label(
-                ui,
-                &format!("ワールドに {} がありません。Blender で同じ名前のカメラを置くと、その位置が使えます。", world::PEEK_WINDOW_NODE),
-                10.5,
-                TEXT_HINT,
-            );
+        if fit.clicked() {
+            *action = Some(Action::FitScreen);
         }
     }
 
@@ -1323,7 +1391,7 @@ fn window_properties(
             widgets::wrapped_label(
                 ui,
                 &format!(
-                    "この画面は基準と大きさが違うので、作ったときの {:.2} 倍の大きさで見えます（俯瞰ビューの灰色の枠が基準の画面）。",
+                    "この画面は基準と大きさが違うので、作ったときの {:.2} 倍の大きさで見えます（シーンビューの灰色の枠が基準の画面）。",
                     1.0 / k
                 ),
                 10.5,
@@ -1335,7 +1403,7 @@ fn window_properties(
             .width(ui.available_width())
             .enabled(!is_current)
             .show(ui)
-            .on_hover_text("この画面で、のぞき窓に映っている範囲を、シーンの基準にする")
+            .on_hover_text("この画面で、スクリーンに映っている範囲を、シーンの基準にする")
             .clicked()
         {
             *action = Some(Action::SetReference);
@@ -1596,7 +1664,6 @@ fn discard_dialog(ctx: &egui::Context, pending: &Pending, untitled: bool, action
         Pending::New => ("新しいシーンを作ると、最後に保存してからの変更は失われます。", "新規作成"),
         Pending::Open(_) => ("別のシーンを開くと、最後に保存してからの変更は失われます。", "開く"),
         Pending::ImportScene => ("シーンをインポートすると、最後に保存してからの変更は失われます。", "インポート"),
-        Pending::ImportWorld => ("ワールドをインポートすると新しいシーンになり、最後に保存してからの変更は失われます。", "インポート"),
     };
     let body = if untitled {
         format!("{} このシーンはまだ名前を付けて保存していません。", body)
@@ -1623,7 +1690,7 @@ fn discard_dialog(ctx: &egui::Context, pending: &Pending, untitled: bool, action
 fn save_as_dialog(ctx: &egui::Context, dialog: &mut SaveAsDialog, current: Option<&str>, action: &mut Option<Action>) {
     let overwrite = library::validate_name(&dialog.name)
         .is_ok_and(|name| Some(name.as_str()) != current && library::exists(&name));
-    dialog_frame(ctx, "save_as", 420.0, Icon::Check, ICON_WINDOW, "名前を付けて保存", |ui| {
+    dialog_frame(ctx, "save_as", 420.0, Icon::Check, ICON_SCREEN, "名前を付けて保存", |ui| {
         let edit = ui.add(
             egui::TextEdit::singleline(&mut dialog.name)
                 .desired_width(f32::INFINITY)
@@ -1659,7 +1726,7 @@ fn save_as_dialog(ctx: &egui::Context, dialog: &mut SaveAsDialog, current: Optio
 
 fn delete_scene_dialog(ctx: &egui::Context, name: &str, is_current: bool, action: &mut Option<Action>) {
     let title = format!("シーン「{}」を削除しますか?", name);
-    let mut body = "シーンファイル (.peek) を削除します。中のワールドやモデルも一緒に消え、元に戻せません。".to_string();
+    let mut body = "シーンファイル (.peek) を削除します。中のモデルも一緒に消え、元に戻せません。".to_string();
     if is_current {
         body.push_str("今開いているシーンなので、削除したあとは別のシーンを開きます。");
     }
@@ -1682,11 +1749,11 @@ fn delete_dialog(ctx: &egui::Context, layout: &SceneLayout, id: u64, action: &mu
     };
     let title = format!("「{}」を削除しますか?", object.name);
     let body = match &object.kind {
-        ObjectKind::Model { path } => {
-            let file = std::path::Path::new(path)
+        ObjectKind::Model(model) => {
+            let file = std::path::Path::new(&model.path)
                 .file_name()
                 .map(|f| f.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.clone());
+                .unwrap_or_else(|| model.path.clone());
             format!("シーンから取り除きます。元のモデルファイル({})は消えません。", file)
         }
         ObjectKind::Cube { .. } => "シーンから取り除きます。".to_string(),

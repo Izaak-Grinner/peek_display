@@ -105,8 +105,8 @@ fn inspection_overlay(
         .show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 ui.strong("検査モード");
-                ui.label("左: 俯瞰カメラ (右ドラッグ: 回転 / ホイール: ズーム / ホイールを押しながらドラッグ: 平行移動)");
-                ui.label("右: 覗き込みカメラ");
+                ui.label("左: シーンビュー (右ドラッグ: 回転 / ホイール: ズーム / ホイールを押しながらドラッグ: 平行移動)");
+                ui.label("右: メインカメラ");
                 ui.label(format!(
                     "頭の位置 (cm): x {:.1}  y {:.1}  z {:.1}",
                     pose.x, pose.y, pose.z

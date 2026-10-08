@@ -4,23 +4,23 @@ use bevy::{
     window::{MonitorSelection, PrimaryWindow, WindowMode},
 };
 
-use crate::camera::{main_camera::MainDisplayCamera, preview::PreviewCamera};
+use crate::camera::{main_camera::MainCamera, scene_view::SceneViewCamera};
 use crate::config::DisplayInfo;
 
 #[derive(States, Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AppMode {
-    // モードを選ぶ画面 (背景に俯瞰カメラ)。起動したらここから始まる
+    // モードを選ぶ画面 (背景にシーンビュー)。起動したらここから始まる
     #[default]
     Home,
-    // 展示用。覗き込みカメラだけを全画面表示する
+    // 展示用。メインカメラだけを全画面表示する
     Production,
-    // 左に俯瞰カメラ、右に覗き込みカメラ
+    // 左にシーンビュー、右にメインカメラ
     Inspection,
-    // オブジェクトの配置と覗き込みカメラの設定
+    // オブジェクトとスクリーンの配置
     Edit,
 }
 
-// 編集モードで UI が占める幅と高さ (論理ピクセル)。俯瞰カメラの描画範囲から除く
+// 編集モードで UI が占める幅と高さ (論理ピクセル)。シーンビューの描画範囲から除く
 #[derive(Resource, Default)]
 pub struct EditViewInsets {
     // 右側のパネルの幅
@@ -67,15 +67,15 @@ fn update_camera_layout(
     display: Res<DisplayInfo>,
     insets: Res<EditViewInsets>,
     window: Single<&Window, With<PrimaryWindow>>,
-    mut preview: Single<&mut Camera, (With<PreviewCamera>, Without<MainDisplayCamera>)>,
-    mut main: Single<&mut Camera, (With<MainDisplayCamera>, Without<PreviewCamera>)>,
+    mut scene_view: Single<&mut Camera, (With<SceneViewCamera>, Without<MainCamera>)>,
+    mut main: Single<&mut Camera, (With<MainCamera>, Without<SceneViewCamera>)>,
 ) {
     let size = UVec2::new(window.physical_width(), window.physical_height());
     if size.x == 0 || size.y == 0 {
         return; // 最小化中
     }
 
-    let (preview_layout, main_layout) = match mode.get() {
+    let (scene_view_layout, main_layout) = match mode.get() {
         AppMode::Home => (Some(None), None),
         AppMode::Production => (None, Some(None)),
         AppMode::Inspection => {
@@ -99,7 +99,7 @@ fn update_camera_layout(
         }
     };
 
-    apply_layout(&mut preview, preview_layout);
+    apply_layout(&mut scene_view, scene_view_layout);
     apply_layout(&mut main, main_layout);
 }
 

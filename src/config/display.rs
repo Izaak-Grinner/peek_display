@@ -28,8 +28,8 @@ impl DisplayInfo {
         self.size.x / self.size.y
     }
 
-    // シーンを作ったときの画面 (基準の画面) に映っていた範囲が全部入るように、ワールドを見る縮尺。
-    // のぞき窓の大きさと目の位置にこれを掛ける。1 より大きければ、ワールドは小さく見える (CSS の contain)
+    // シーンを作ったときの画面 (基準の画面) に映っていた範囲が全部入るように、シーンを見る縮尺。
+    // スクリーンの大きさと目の位置にこれを掛ける。1 より大きければ、シーンは小さく見える (CSS の contain)
     pub fn view_scale(&self, reference: Option<Vec2>) -> f32 {
         match reference {
             Some(r) if r.x > 0.0 && r.y > 0.0 => (r.x / self.size.x).max(r.y / self.size.y),
@@ -100,7 +100,7 @@ mod tests {
         assert_eq!(info.view_scale(Some(Vec2::new(0.32, 0.20))), 1.0);
         // 基準が 16:9 で幅が同じ: 幅で決まる (上下が少し余分に見える)
         assert_eq!(info.view_scale(Some(Vec2::new(0.32, 0.18))), 1.0);
-        // 基準のほうが 2 倍大きい: 2 倍の範囲を見る (ワールドは半分の大きさに見える)
+        // 基準のほうが 2 倍大きい: 2 倍の範囲を見る (シーンは半分の大きさに見える)
         assert_eq!(info.view_scale(Some(Vec2::new(0.64, 0.40))), 2.0);
         // 基準が縦に長い: 高さで決まる
         assert!((info.view_scale(Some(Vec2::new(0.32, 0.30))) - 1.5).abs() < 1e-6);

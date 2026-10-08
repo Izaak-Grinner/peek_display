@@ -32,9 +32,9 @@ pub fn home_ui(
                                 ui.label(detail);
                                 ui.add_space(10.0);
                             };
-                            mode_button(ui, "本番モード", "覗き込みカメラを全画面で表示", AppMode::Production);
-                            mode_button(ui, "検査モード", "俯瞰カメラと覗き込みカメラを並べて表示", AppMode::Inspection);
-                            mode_button(ui, "編集モード", "オブジェクトの配置と覗き込みカメラの設定", AppMode::Edit);
+                            mode_button(ui, "本番モード", "メインカメラを全画面で表示", AppMode::Production);
+                            mode_button(ui, "検査モード", "シーンビューとメインカメラを並べて表示", AppMode::Inspection);
+                            mode_button(ui, "編集モード", "オブジェクトとスクリーンの配置", AppMode::Edit);
 
                             ui.add_space(6.0);
                             if ui.button("終了").clicked() {

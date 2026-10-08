@@ -1,7 +1,8 @@
 use bevy::{camera::primitives::Aabb, prelude::*};
 use std::collections::HashSet;
 
-use crate::scene::layout::{FLOOR_Y, ObjectKind, SceneLayout, SceneObject};
+use crate::scene::layout::{FLOOR_Y, ObjectKind, Placement, SceneLayout, SceneObject};
+use crate::scene::model::{self, LoadedModels};
 use crate::scene::package_store::PackageStore;
 
 pub struct ScenePlugin;
@@ -14,18 +15,18 @@ impl Plugin for ScenePlugin {
                 (
                     sync_scene_objects.run_if(resource_changed::<SceneLayout>),
                     apply_light.run_if(resource_changed::<SceneLayout>),
-                    auto_fit_imported,
+                    place_imported,
                 )
                     .chain(),
             );
     }
 }
 
-// アプリが作る部屋の壁・床・天井 (ワールドがあるときは隠す)
+// アプリが作る部屋の壁・床・天井 (シーンの設定で隠せる)
 #[derive(Component)]
 pub struct RoomPart;
 
-// アプリが置くライト (ワールドにライトがあるときは消す)
+// アプリが置くライト (ライトの入ったモデルがあるときは消す)
 #[derive(Component)]
 pub struct DefaultLight;
 
@@ -33,9 +34,9 @@ pub struct DefaultLight;
 #[derive(Component)]
 pub struct Placeable(pub u64);
 
-// インポート直後のモデル。読み込みが終わったら大きさを自動調整する
+// インポート直後のモデル。読み込みが終わったら置き方を決める
 #[derive(Component)]
-struct AutoFit;
+struct PlaceOnLoad;
 
 // インポートしたモデルの最大辺をこの長さ(メートル)に合わせる
 const AUTO_FIT_SIZE: f32 = 0.3;
@@ -106,7 +107,7 @@ fn sync_scene_objects(
     }
 }
 
-fn spawn_object(
+pub fn spawn_object(
     commands: &mut Commands,
     asset_server: &AssetServer,
     store: &PackageStore,
@@ -116,11 +117,15 @@ fn spawn_object(
 ) {
     let transform = object.placement.to_transform();
     let mut entity = match &object.kind {
-        ObjectKind::Model { path } => commands.spawn((
-            // シーンの中のファイルから読み込む (peek://<番号>/<path>)
-            SceneRoot(asset_server.load(GltfAssetLabel::Scene(0).from_asset(store.asset_path(path)))),
-            transform,
-        )),
+        ObjectKind::Model(model) => {
+            // シーンの中のファイルから読み込む (scene://<番号>/<path>)
+            let mut entity = commands.spawn((
+                SceneRoot(asset_server.load(GltfAssetLabel::Scene(0).from_asset(store.asset_path(&model.path)))),
+                transform,
+            ));
+            entity.observe(model::on_model_ready);
+            entity
+        }
         ObjectKind::Cube { color, size } => commands.spawn((
             Mesh3d(meshes.add(Cuboid::from_length(*size))),
             MeshMaterial3d(materials.add(Color::srgb(color.x, color.y, color.z))),
@@ -128,15 +133,15 @@ fn spawn_object(
         )),
     };
     entity.insert((Placeable(object.id), Name::new(object.name.clone())));
-    if object.auto_fit {
-        entity.insert(AutoFit);
+    if object.place_on_load {
+        entity.insert(PlaceOnLoad);
     }
 }
 
-// メッシュの Aabb とワールド座標 (大きさを求めるときに使う)
+// メッシュの Aabb とシーンでの座標 (大きさを求めるときに使う)
 pub type MeshBoundsQuery<'w, 's> = Query<'w, 's, (Option<&'static Aabb>, &'static GlobalTransform), With<Mesh3d>>;
 
-// entity とその子孫のメッシュ全体を囲む箱 (ワールド座標の min, max)。
+// entity とその子孫のメッシュ全体を囲む箱 (シーンでの座標の min, max)。
 // まだシーンが展開されていない、または Aabb が計算されていないときは None
 pub fn mesh_bounds(
     entity: Entity,
@@ -172,26 +177,49 @@ pub fn mesh_bounds(
     (mesh_count > 0).then_some((min, max))
 }
 
-// インポートしたモデルの読み込みが終わったら、最大辺が AUTO_FIT_SIZE になるよう縮尺を決め、
-// 底面を床に合わせる。メッシュの Aabb は PostUpdate で計算されるので、揃うまで毎フレーム待つ
-fn auto_fit_imported(
+// インポートしたモデルの読み込みが終わったら、置き方を決める。
+// screen カメラが入っていれば (Blender で作った部屋など)、Blender の位置と大きさのまま置き、スクリーンをそのカメラに合わせて、アプリの部屋は隠す。
+// 入っていなければ、最大辺が AUTO_FIT_SIZE になるよう縮尺を決め、底面を床に合わせる。
+// メッシュの Aabb は PostUpdate で計算されるので、揃うまで毎フレーム待つ
+fn place_imported(
     mut commands: Commands,
     mut layout: ResMut<SceneLayout>,
-    targets: Query<(Entity, &Placeable), With<AutoFit>>,
+    models: Res<LoadedModels>,
+    targets: Query<(Entity, &Placeable), With<PlaceOnLoad>>,
     children: Query<&Children>,
     meshes: MeshBoundsQuery,
 ) {
     for (entity, placeable) in &targets {
-        let Some((min, max)) = mesh_bounds(entity, &children, &meshes) else {
+        let Some(info) = models.get(placeable.0) else {
             continue;
         };
+        let bounds = mesh_bounds(entity, &children, &meshes);
+        if info.screen.is_none() && bounds.is_none() {
+            continue;
+        }
 
-        commands.entity(entity).remove::<AutoFit>();
-        let Some(object) = layout.object_mut(placeable.0) else {
+        commands.entity(entity).remove::<PlaceOnLoad>();
+        let layout = layout.as_mut();
+        let Some(object) = layout.objects.iter_mut().find(|o| o.id == placeable.0) else {
             continue;
         };
-        object.auto_fit = false;
+        object.place_on_load = false;
 
+        if let Some(screen) = info.screen {
+            object.placement = Placement::default();
+            layout.screen = Placement::from_transform(&screen);
+            layout.show_room = false;
+            info!(
+                "{} に {} カメラがあるので、Blender の位置と大きさのまま置き、スクリーンを合わせました",
+                object.name,
+                model::SCREEN_NODE
+            );
+            continue;
+        }
+
+        let Some((min, max)) = bounds else {
+            continue;
+        };
         let largest = (max - min).max_element();
         if largest <= f32::EPSILON {
             continue;

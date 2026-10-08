@@ -3,7 +3,7 @@ use bevy::prelude::*;
 use crate::camera::off_axis_projection::OffAxisProjection;
 
 #[derive(Component)]
-pub struct MainDisplayCamera;
+pub struct MainCamera;
 
 pub struct MainCameraPlugin;
 
@@ -24,6 +24,6 @@ fn setup_main_camera(mut commands: Commands) {
             ..default()
         },
         Transform::default(),
-        MainDisplayCamera,
+        MainCamera,
     ));
 }

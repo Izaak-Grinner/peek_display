@@ -4,7 +4,7 @@ use bevy::prelude::*;
 use std::path::PathBuf;
 
 use crate::scene::layout::SceneLayout;
-use crate::scene::package::{self, PEEK_EXTENSION, PackageFiles};
+use crate::scene::package::{self, SCENE_EXTENSION, PackageFiles};
 use crate::scene::package_store::PackageStore;
 
 const SCENES_DIR: &str = "scenes";
@@ -154,8 +154,8 @@ pub fn list() -> Vec<String> {
     let mut names: Vec<String> = entries
         .filter_map(|entry| {
             let path = entry.ok()?.path();
-            let is_peek = path.extension().is_some_and(|e| e.eq_ignore_ascii_case(PEEK_EXTENSION));
-            if !is_peek || !path.is_file() {
+            let is_scene = path.extension().is_some_and(|e| e.eq_ignore_ascii_case(SCENE_EXTENSION));
+            if !is_scene || !path.is_file() {
                 return None;
             }
             Some(path.file_stem()?.to_string_lossy().into_owned())
@@ -208,16 +208,16 @@ pub fn unique_name(base: &str) -> String {
 
 // シーンファイルの場所
 pub fn scene_path(name: &str) -> PathBuf {
-    dir().join(format!("{}.{}", name, PEEK_EXTENSION))
+    dir().join(format!("{}.{}", name, SCENE_EXTENSION))
 }
 
 fn load(name: &str) -> Result<(SceneLayout, PackageFiles), String> {
-    package::read_peek(&scene_path(name)).map_err(|e| format!("シーン「{}」を読めませんでした ({})", name, e))
+    package::read_scene_file(&scene_path(name)).map_err(|e| format!("シーン「{}」を読めませんでした ({})", name, e))
 }
 
 fn write(name: &str, layout: &SceneLayout, files: &PackageFiles) -> Result<(), String> {
     std::fs::create_dir_all(dir())
         .map_err(|e| e.to_string())
-        .and_then(|_| package::write_peek(&scene_path(name), layout, files))
+        .and_then(|_| package::write_scene_file(&scene_path(name), layout, files))
         .map_err(|e| format!("シーン「{}」に書き込めません ({})", name, e))
 }
