@@ -1,4 +1,4 @@
-// モデルの取り込み。ファイルを読み込み、開いているシーン (.peek) の中に入れる
+// モデル・ワールドの取り込み。ファイルを読み込み、開いているシーン (.peek) の中に入れる
 // (assets フォルダにはコピーしない。シーンを保存すると .peek に入る)
 use bevy::prelude::*;
 use std::path::{Path, PathBuf};
@@ -6,12 +6,21 @@ use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use crate::scene::editor::{EditState, Selection};
-use crate::scene::layout::{FLOOR_Y, Model, ObjectKind, Placement, SceneLayout};
+use crate::scene::layout::{FLOOR_Y, Model, ObjectKind, OnLoad, Placement, SceneLayout};
 use crate::scene::package::{PackageFiles, is_inside};
 use crate::scene::package_store::PackageStore;
 
 // シーンの中で、追加したモデルを置くフォルダ
 const MODEL_DIR: &str = "models";
+
+// 何として取り込むか
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImportKind {
+    // ひとかたまりのモデル (ねこなど)。スクリーンの正面に、大きさを合わせて置く
+    Model,
+    // Blender などで作ったワールド。親を持たないオブジェクトごとに分け、Blender の位置のまま置く
+    World,
+}
 
 // スクリーンからどれだけ奥に置くか(メートル)
 const IMPORT_DISTANCE: f32 = 0.4;
@@ -38,6 +47,7 @@ impl ModelFiles {
 enum ImportResult {
     Cancelled,
     Imported {
+        kind: ImportKind,
         source: PathBuf,
         model: ModelFiles,
         name: String,
@@ -56,13 +66,13 @@ impl ImportState {
         self.receiver.is_some()
     }
 
-    pub fn start(&mut self) {
+    pub fn start(&mut self, kind: ImportKind) {
         if self.busy() {
             return;
         }
         let (sender, receiver) = channel();
         std::thread::spawn(move || {
-            let _ = sender.send(run_import());
+            let _ = sender.send(run_import(kind));
         });
         self.receiver = Some(Mutex::new(receiver));
     }
@@ -95,30 +105,36 @@ fn poll_import(
 
     match result {
         ImportResult::Cancelled => {}
-        ImportResult::Imported { source, model, name } => {
+        ImportResult::Imported { kind, source, model, name } => {
             // シーンの中の models/<名前>/ に入れる
             let folder = store.unique_folder(MODEL_DIR, &name);
             let (path, files) = model.placed_in(&folder);
             for (rel, bytes) in files {
                 store.insert(rel, bytes);
             }
-            // スクリーンの正面・奥に、床に置く (スクリーンが傾いていても、モデルはまっすぐ立てる)。
-            // 読み込みが終わったら、scene.rs が大きさや位置を決め直す
-            let screen = &layout.screen;
-            let facing = Quat::from_rotation_y(screen.yaw_deg.to_radians());
-            let mut position = screen.position + facing * Vec3::new(0.0, 0.0, -IMPORT_DISTANCE);
-            position.y = FLOOR_Y;
-            let placement = Placement {
-                position,
-                yaw_deg: screen.yaw_deg,
-                ..default()
+            // モデルはスクリーンの正面・奥に、床に置く (スクリーンが傾いていても、モデルはまっすぐ立てる)。
+            // ワールドは Blender の位置のまま置く。読み込みが終わったら、scene.rs が置き方を決め直す
+            let (placement, on_load) = match kind {
+                ImportKind::Model => {
+                    let screen = &layout.screen;
+                    let facing = Quat::from_rotation_y(screen.yaw_deg.to_radians());
+                    let mut position = screen.position + facing * Vec3::new(0.0, 0.0, -IMPORT_DISTANCE);
+                    position.y = FLOOR_Y;
+                    let placement = Placement {
+                        position,
+                        yaw_deg: screen.yaw_deg,
+                        ..default()
+                    };
+                    (placement, OnLoad::Fit)
+                }
+                ImportKind::World => (Placement::default(), OnLoad::Split),
             };
-            let model = Model::new(&path, Some(source.to_string_lossy().into_owned()));
-            let id = layout.add_object(&name, ObjectKind::Model(model), placement);
+            let id = layout.add_object(&name, ObjectKind::Model(Model::new(&path)), placement);
             if let Some(object) = layout.object_mut(id) {
-                object.place_on_load = true;
+                object.on_load = Some(on_load);
             }
-            state.selection = Some(Selection::Object(id));
+            // ワールドは部品に分けると id が変わるので、選ばない
+            state.selection = (kind == ImportKind::Model).then_some(Selection::Object(id));
             state.import_error = None;
             info!("{} をインポートしました", source.display());
         }
@@ -129,9 +145,13 @@ fn poll_import(
     }
 }
 
-fn run_import() -> ImportResult {
+fn run_import(kind: ImportKind) -> ImportResult {
+    let title = match kind {
+        ImportKind::Model => "インポートするモデルを選択",
+        ImportKind::World => "インポートするワールドを選択",
+    };
     let Some(source) = rfd::FileDialog::new()
-        .set_title("インポートするモデルを選択")
+        .set_title(title)
         .add_filter("glTF (.glb / .gltf)", &["glb", "gltf"])
         .pick_file()
     else {
@@ -142,7 +162,7 @@ fn run_import() -> ImportResult {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "model".to_string());
     match read_model_files(&source) {
-        Ok(model) => ImportResult::Imported { source, model, name },
+        Ok(model) => ImportResult::Imported { kind, source, model, name },
         Err(e) => ImportResult::Failed(e),
     }
 }

@@ -6,7 +6,6 @@ use crate::scene::layout::{Placement, SceneLayout};
 use crate::scene::library::{self, SceneLibrary};
 use crate::scene::package_store::PackageStore;
 use crate::scene::highlight::SELECTION_COLOR;
-use crate::scene::model::{self, LoadedModels, ModelNode};
 use crate::scene::scene::Placeable;
 use crate::ui::UiInputState;
 
@@ -21,11 +20,7 @@ pub enum Selection {
     Screen,
     // シーンの照明 (太陽光と環境光)
     Light,
-    // アプリが作る部屋 (床と壁)
-    Room,
     Object(u64),
-    // モデルの中のノード (モデルのオブジェクトの id、Blender のオブジェクト名)
-    Node { object: u64, name: String },
 }
 
 // 最後に保存したときの結果
@@ -202,7 +197,7 @@ impl EditState {
     // 変更を履歴に記録する。idle: マウスもキーも押していない (ドラッグなどが終わった)
     fn track_history(&mut self, layout: &SceneLayout, config: &AppConfig, idle: bool) {
         // 読み込み直後の自動調整は、取り込みと一緒に1回分にする
-        let adjusting = layout.objects.iter().any(|o| o.place_on_load);
+        let adjusting = layout.objects.iter().any(|o| o.on_load.is_some());
         let Some(settled) = &self.history.settled else {
             self.history.settled = Some(Snapshot::new(layout, config));
             return;
@@ -313,7 +308,7 @@ impl Plugin for EditorPlugin {
             .add_observer(select_on_click)
             .add_systems(
                 Update,
-                (keyboard_edit, track_history, draw_selection)
+                (keyboard_edit, track_history, draw_selection, update_click_through)
                     .chain()
                     .run_if(in_state(AppMode::Edit)),
             );
@@ -321,17 +316,13 @@ impl Plugin for EditorPlugin {
 }
 
 // シーンビューでオブジェクトをクリックして選択する。
-// glb の子メッシュに当たった場合も、親をたどって Placeable を探す。
-// 選んでいるモデル (またはその中のノード) をもう一度クリックしたときは、中のノード (ModelNode) を選ぶ
-#[allow(clippy::too_many_arguments)]
+// glb の子メッシュに当たった場合も、親をたどって Placeable を探す
 fn select_on_click(
     mut click: On<Pointer<Click>>,
     mode: Res<State<AppMode>>,
     ui_input: Res<UiInputState>,
     parents: Query<&ChildOf>,
     placeables: Query<&Placeable>,
-    model_nodes: Query<&ModelNode>,
-    models: Res<LoadedModels>,
     mut state: ResMut<EditState>,
 ) {
     if *mode.get() != AppMode::Edit
@@ -342,30 +333,18 @@ fn select_on_click(
     }
 
     let mut entity = click.entity;
-    let mut node = None;
     loop {
         if let Ok(placeable) = placeables.get(entity) {
-            let id = placeable.0;
-            let drill_in = match &state.selection {
-                Some(Selection::Object(selected)) | Some(Selection::Node { object: selected, .. }) => *selected == id,
-                _ => false,
-            } && models.get(id).is_some_and(|info| info.lists_nodes());
-            state.selection = Some(match node {
-                Some(name) if drill_in => Selection::Node { object: id, name },
-                _ => Selection::Object(id),
-            });
+            state.selection = Some(Selection::Object(placeable.0));
             click.propagate(false);
             return;
-        }
-        if node.is_none() {
-            node = model_nodes.get(entity).ok().map(|n| n.0.clone());
         }
         match parents.get(entity) {
             Ok(child_of) => entity = child_of.parent(),
             Err(_) => break,
         }
     }
-    // 部屋など、配置対象でないものをクリックしたら選択を外す
+    // オブジェクトでないものをクリックしたら選択を外す
     state.selection = None;
 }
 
@@ -374,7 +353,6 @@ fn keyboard_edit(
     time: Res<Time>,
     ui_input: Res<UiInputState>,
     state: Res<EditState>,
-    models: Res<LoadedModels>,
     mut layout: ResMut<SceneLayout>,
 ) {
     // Ctrl+S などのショートカットで動かないようにする
@@ -432,26 +410,9 @@ fn keyboard_edit(
             light.yaw_deg += turn_y * ROTATE_SPEED * dt;
             light.illuminance = (light.illuminance * SCALE_SPEED.powf(grow * dt)).max(0.0);
         }
-        Selection::Room => {}
         Selection::Object(id) => {
             if let Some(object) = layout.object_mut(*id) {
                 apply(&mut object.placement, delta, true);
-            }
-        }
-        Selection::Node { object, name } => {
-            let (Some(object), Some(info)) = (layout.object_mut(*object), models.get(*object)) else {
-                return;
-            };
-            // ノードの位置はモデルの中の座標なので、シーンの軸に沿った移動を直す
-            let parent = object.placement.clone();
-            let local_delta = parent.rotation().inverse() * delta / parent.scale.max(1e-5);
-            let Some(model) = object.model_mut() else {
-                return;
-            };
-            // 初めて動かしたときに、Blender の値から変更として記録する
-            if let Some(mut placement) = model::node_placement(model, info, name) {
-                apply(&mut placement, local_delta, true);
-                model.node_mut(name).placement = Some(placement);
             }
         }
     }
@@ -472,12 +433,39 @@ fn track_history(
     state.bypass_change_detection().track_history(&layout, &config, idle);
 }
 
+// クリックで選ばないオブジェクトのメッシュに付ける印 (Pickable::IGNORE を付けたもの)
+#[derive(Component)]
+struct ClickThrough;
+
+// クリックで選ばないオブジェクト (selectable = false) は、メッシュをクリックの対象から外し、後ろのものに届くようにする。
+// モデルのメッシュは読み込みが終わってから増えるので、毎フレーム調べる
+fn update_click_through(
+    mut commands: Commands,
+    layout: Res<SceneLayout>,
+    placeables: Query<(Entity, &Placeable)>,
+    children: Query<&Children>,
+    meshes: Query<Has<ClickThrough>, With<Mesh3d>>,
+) {
+    for (entity, placeable) in &placeables {
+        let selectable = layout.object(placeable.0).is_none_or(|o| o.selectable);
+        for target in std::iter::once(entity).chain(children.iter_descendants(entity)) {
+            let Ok(ignored) = meshes.get(target) else {
+                continue;
+            };
+            if !selectable && !ignored {
+                commands.entity(target).insert((Pickable::IGNORE, ClickThrough));
+            } else if selectable && ignored {
+                commands.entity(target).remove::<(Pickable, ClickThrough)>();
+            }
+        }
+    }
+}
+
 // 選択中の対象に目印を描く (ギズモはシーンビューにしか映らない)
 fn draw_selection(
     mut gizmos: Gizmos,
     state: Res<EditState>,
     layout: Res<SceneLayout>,
-    models: Res<LoadedModels>,
     globals: Query<&GlobalTransform>,
     placeables: Query<(Entity, &Placeable)>,
 ) {
@@ -490,7 +478,7 @@ fn draw_selection(
     };
     match &state.selection {
         // スクリーンの縁取りは scene_view.rs (枠・視線・目の位置をまとめて縁取る)
-        Some(Selection::Screen) | Some(Selection::Room) => {}
+        Some(Selection::Screen) => {}
         // 光の向きを矢印で出す (スクリーンの少し上から、光が進む向きへ)
         Some(Selection::Light) => {
             let start = layout.screen.position + Vec3::Y * 0.25;
@@ -499,11 +487,6 @@ fn draw_selection(
         Some(Selection::Object(id)) => {
             if let Some((entity, _)) = placeables.iter().find(|(_, p)| p.0 == *id) {
                 origin(&mut gizmos, entity);
-            }
-        }
-        Some(Selection::Node { object, name }) => {
-            if let Some(node) = models.get(*object).and_then(|info| info.node(name)) {
-                origin(&mut gizmos, node.entity);
             }
         }
         None => {}

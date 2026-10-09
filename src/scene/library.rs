@@ -3,6 +3,7 @@
 use bevy::prelude::*;
 use std::path::PathBuf;
 
+use crate::scene::default_room;
 use crate::scene::layout::SceneLayout;
 use crate::scene::package::{self, SCENE_EXTENSION, PackageFiles};
 use crate::scene::package_store::PackageStore;
@@ -38,15 +39,14 @@ impl SceneLibrary {
         let name = remembered.or_else(|| names.first().cloned());
 
         let Some(name) = name else {
-            // シーンが1つも無いときは、空のシーンを作る
-            let layout = SceneLayout::empty();
-            let files = PackageFiles::new();
+            // シーンが1つも無いときは、新しいシーンを作る
+            let (layout, files) = default_room::new_scene();
             let mut library = Self::untitled(FIRST_SCENE_NAME);
             match write(FIRST_SCENE_NAME, &layout, &files) {
                 Ok(()) => {
                     library.current = Some(FIRST_SCENE_NAME.to_string());
                     library.remember_current();
-                    info!("シーンが無かったので空のシーン {} を作成しました", FIRST_SCENE_NAME);
+                    info!("シーンが無かったので新しいシーン {} を作成しました", FIRST_SCENE_NAME);
                 }
                 Err(e) => warn!("{}", e),
             }
@@ -117,7 +117,7 @@ impl SceneLibrary {
         Ok(())
     }
 
-    // 最後に開いていたシーン (current.txt) を開き直す。無ければ空のシーンにする
+    // 最後に開いていたシーン (current.txt) を開き直す。無ければ新しいシーンにする
     pub fn reopen_last(&mut self, store: &mut PackageStore) -> SceneLayout {
         let remembered = std::fs::read_to_string(dir().join(CURRENT_FILE))
             .ok()
@@ -128,8 +128,9 @@ impl SceneLibrary {
                 Err(e) => warn!("{}", e),
             }
         }
-        store.replace(PackageFiles::new());
-        SceneLayout::empty()
+        let (layout, files) = default_room::new_scene();
+        store.replace(files);
+        layout
     }
 
     fn remember_current(&self) {

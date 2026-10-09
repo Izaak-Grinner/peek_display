@@ -299,17 +299,20 @@ mod tests {
     #[test]
     fn write_then_read_round_trip() {
         let mut layout = SceneLayout::default();
-        let mut room = Model::new("models/room/room.gltf", Some(r"C:\blender\room.gltf".to_string()));
-        room.node_mut("Cube").hidden = true;
-        room.node_mut("Chair").placement = Some(Placement {
-            position: Vec3::new(0.1, 0.2, 0.3),
-            yaw_deg: 30.0,
-            scale: 2.0,
-            ..default()
-        });
-        layout.add_object("room", ObjectKind::Model(room), Placement::default());
-        layout.show_room = false;
+        // ワールドの部品 (同じファイルを 2 つの部品が共有する)
+        layout.add_object("Floor", ObjectKind::Model(Model::part("models/room/room.gltf", "Floor")), Placement::default());
+        layout.add_object(
+            "Chair",
+            ObjectKind::Model(Model::part("models/room/room.gltf", "Chair")),
+            Placement {
+                position: Vec3::new(0.1, 0.2, 0.3),
+                yaw_deg: 30.0,
+                scale: 2.0,
+                ..default()
+            },
+        );
         layout.reference = Some(Vec2::new(0.3446, 0.2154));
+        layout.objects[0].selectable = false;
         layout.light.illuminance = 1234.0;
         layout.light.ambient = 20.0;
         layout.light.pitch_deg = -30.0;

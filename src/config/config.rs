@@ -26,8 +26,6 @@ pub struct AppConfig {
     pub viewer_min_distance: f32,
     pub opentrack_path: String,
     pub minimize_opentrack: bool,
-    // OpenTrack で使うカメラの名前。空なら OpenTrack が見つけたカメラを使う
-    pub opentrack_camera: String,
     // カメラの対角の視野角 (度)。OpenTrack が距離の計算に使う
     pub camera_fov_deg: f32,
     // 印刷した AR マーカーの大きさ (黒い四角の一辺, cm)
@@ -43,7 +41,6 @@ impl Default for AppConfig {
             viewer_min_distance: 0.05,
             opentrack_path: r"C:\Program Files (x86)\opentrack\opentrack.exe".to_string(),
             minimize_opentrack: true,
-            opentrack_camera: String::new(),
             camera_fov_deg: 56.0,
             marker_size_cm: ARUCO_MARKER_SIZE_CM,
         }
@@ -70,8 +67,7 @@ impl AppConfig {
 
     // OpenTrack のプロファイルに書く値が同じか (違えば OpenTrack を起動し直す)
     pub fn same_opentrack_settings(&self, other: &Self) -> bool {
-        self.opentrack_camera == other.opentrack_camera
-            && self.camera_fov_deg.round() == other.camera_fov_deg.round()
+        self.camera_fov_deg.round() == other.camera_fov_deg.round()
             && self.minimize_opentrack == other.minimize_opentrack
     }
 
@@ -124,7 +120,6 @@ impl AppConfig {
                     config.minimize_opentrack =
                         parse_or_warn(CONFIG_FILE_NAME, key, value, config.minimize_opentrack)
                 }
-                "opentrack_camera" => config.opentrack_camera = value.to_string(),
                 "camera_fov_deg" => {
                     config.camera_fov_deg =
                         parse_or_warn(CONFIG_FILE_NAME, key, value, config.camera_fov_deg)
@@ -161,8 +156,6 @@ impl AppConfig {
              # マーカーの認識をカメラ映像で確認したいときは false にする\n\
              # (true でも、タスクトレイのアイコンをクリックすれば画面を開ける)\n\
              minimize_opentrack={}\n\
-             # OpenTrack で使うカメラの名前 (空なら OpenTrack が見つけたカメラを使う)\n\
-             opentrack_camera={}\n\
              # カメラの対角の視野角(度)。OpenTrack が距離の計算に使う\n\
              camera_fov_deg={}\n\
              # 印刷した AR マーカーの大きさ(黒い四角の一辺, cm)。OpenTrack は 4cm として距離を出すので、その比で直す\n\
@@ -173,7 +166,6 @@ impl AppConfig {
             self.viewer_min_distance,
             self.opentrack_path,
             self.minimize_opentrack,
-            self.opentrack_camera,
             self.camera_fov_deg,
             self.marker_size_cm,
         );

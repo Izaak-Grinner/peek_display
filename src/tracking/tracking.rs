@@ -79,12 +79,7 @@ fn ensure_opentrack_profile(config: &AppConfig) {
         &[("use-system-tray", in_tray), ("start-in-tray", in_tray)],
     );
     let fov = format!("{}", config.camera_fov_deg.round() as i32);
-    let mut aruco = vec![("field-of-view", fov.as_str())];
-    // カメラ名が空なら書かない (OpenTrack の設定のまま)
-    if !config.opentrack_camera.trim().is_empty() {
-        aruco.push(("camera-name", config.opentrack_camera.trim()));
-    }
-    new_text = set_profile_settings(&new_text, "aruco-tracker", &aruco);
+    new_text = set_profile_settings(&new_text, "aruco-tracker", &[("field-of-view", fov.as_str())]);
 
     if new_text.replace("\r\n", "\n") == text.replace("\r\n", "\n") {
         return;

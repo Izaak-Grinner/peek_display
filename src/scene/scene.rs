@@ -1,15 +1,15 @@
 use bevy::{camera::primitives::Aabb, prelude::*};
 use std::collections::HashSet;
 
-use crate::scene::layout::{FLOOR_Y, ObjectKind, Placement, SceneLayout, SceneObject};
-use crate::scene::model::{self, LoadedModels};
+use crate::scene::layout::{FLOOR_Y, Model, ObjectKind, OnLoad, Placement, SceneLayout, SceneObject};
+use crate::scene::model::{self, LoadedModels, ModelInfo, ModelPart};
 use crate::scene::package_store::PackageStore;
 
 pub struct ScenePlugin;
 
 impl Plugin for ScenePlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, (setup_light, setup_room))
+        app.add_systems(Startup, setup_light)
             .add_systems(
                 Update,
                 (
@@ -22,10 +22,6 @@ impl Plugin for ScenePlugin {
     }
 }
 
-// アプリが作る部屋の壁・床・天井 (シーンの設定で隠せる)
-#[derive(Component)]
-pub struct RoomPart;
-
 // アプリが置くライト (ライトの入ったモデルがあるときは消す)
 #[derive(Component)]
 pub struct DefaultLight;
@@ -34,9 +30,9 @@ pub struct DefaultLight;
 #[derive(Component)]
 pub struct Placeable(pub u64);
 
-// インポート直後のモデル。読み込みが終わったら置き方を決める
+// インポート直後のモデル。読み込みが終わったらすること
 #[derive(Component)]
-struct PlaceOnLoad;
+struct PlaceOnLoad(OnLoad);
 
 // インポートしたモデルの最大辺をこの長さ(メートル)に合わせる
 const AUTO_FIT_SIZE: f32 = 0.3;
@@ -107,7 +103,7 @@ fn sync_scene_objects(
     }
 }
 
-pub fn spawn_object(
+fn spawn_object(
     commands: &mut Commands,
     asset_server: &AssetServer,
     store: &PackageStore,
@@ -124,6 +120,9 @@ pub fn spawn_object(
                 transform,
             ));
             entity.observe(model::on_model_ready);
+            if let Some(node) = &model.node {
+                entity.insert(ModelPart(node.clone()));
+            }
             entity
         }
         ObjectKind::Cube { color, size } => commands.spawn((
@@ -133,8 +132,8 @@ pub fn spawn_object(
         )),
     };
     entity.insert((Placeable(object.id), Name::new(object.name.clone())));
-    if object.place_on_load {
-        entity.insert(PlaceOnLoad);
+    if let Some(on_load) = object.on_load {
+        entity.insert(PlaceOnLoad(on_load));
     }
 }
 
@@ -178,21 +177,27 @@ pub fn mesh_bounds(
 }
 
 // インポートしたモデルの読み込みが終わったら、置き方を決める。
-// screen カメラが入っていれば (Blender で作った部屋など)、Blender の位置と大きさのまま置き、スクリーンをそのカメラに合わせて、アプリの部屋は隠す。
+// ワールドとして取り込んだものは、部品に分ける (split_world)。
+// モデルは、peekScreen カメラが入っていれば (Blender で作った部屋など)、Blender の位置と大きさのまま置き、スクリーンをそのカメラに合わせる。
 // 入っていなければ、最大辺が AUTO_FIT_SIZE になるよう縮尺を決め、底面を床に合わせる。
 // メッシュの Aabb は PostUpdate で計算されるので、揃うまで毎フレーム待つ
 fn place_imported(
     mut commands: Commands,
     mut layout: ResMut<SceneLayout>,
     models: Res<LoadedModels>,
-    targets: Query<(Entity, &Placeable), With<PlaceOnLoad>>,
+    targets: Query<(Entity, &Placeable, &PlaceOnLoad)>,
     children: Query<&Children>,
     meshes: MeshBoundsQuery,
 ) {
-    for (entity, placeable) in &targets {
+    for (entity, placeable, on_load) in &targets {
         let Some(info) = models.get(placeable.0) else {
             continue;
         };
+        if on_load.0 == OnLoad::Split {
+            commands.entity(entity).remove::<PlaceOnLoad>();
+            split_world(layout.as_mut(), placeable.0, info);
+            continue;
+        }
         let bounds = mesh_bounds(entity, &children, &meshes);
         if info.screen.is_none() && bounds.is_none() {
             continue;
@@ -200,15 +205,16 @@ fn place_imported(
 
         commands.entity(entity).remove::<PlaceOnLoad>();
         let layout = layout.as_mut();
+        if let Some(screen) = info.screen {
+            layout.screen = Placement::from_transform(&screen);
+        }
         let Some(object) = layout.objects.iter_mut().find(|o| o.id == placeable.0) else {
             continue;
         };
-        object.place_on_load = false;
+        object.on_load = None;
 
-        if let Some(screen) = info.screen {
+        if info.screen.is_some() {
             object.placement = Placement::default();
-            layout.screen = Placement::from_transform(&screen);
-            layout.show_room = false;
             info!(
                 "{} に {} カメラがあるので、Blender の位置と大きさのまま置き、スクリーンを合わせました",
                 object.name,
@@ -237,76 +243,35 @@ fn place_imported(
     }
 }
 
-fn setup_room(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
-    let light_gray = materials.add(Color::srgb(0.6, 0.6, 0.6));
-    let dark_gray = materials.add(Color::srgb(0.3, 0.3, 0.3));
-
-    let tile_size = 0.1;
-    let half_width_tiles: i32 = 6;
-    let depth_tiles: i32 = 10;
-    let room_height = 0.8;
-
-    let room_half_width = half_width_tiles as f32 * tile_size;
-    let room_depth = depth_tiles as f32 * tile_size;
-    let ceiling_y = FLOOR_Y + room_height;
-    let wall_z = -room_depth;
-    let center_z = -room_depth * 0.5;
-
-    // 床(チェッカー模様、画面から奥に向かって奥行きの目印になる)
-    for ix in -half_width_tiles..half_width_tiles {
-        for iz in 0..depth_tiles {
-            let x = ix as f32 * tile_size + tile_size * 0.5;
-            let z = -(iz as f32 * tile_size) - tile_size * 0.5;
-            let material = if (ix + iz).rem_euclid(2) == 0 {
-                light_gray.clone()
-            } else {
-                dark_gray.clone()
-            };
-
-            commands.spawn((
-                Mesh3d(meshes.add(Cuboid::new(tile_size, 0.002, tile_size))),
-                MeshMaterial3d(material),
-                Transform::from_xyz(x, FLOOR_Y, z),
-                RoomPart,
-            ));
-        }
+// ワールドとして取り込んだモデルを、一番上のノード (Blender で親を持たないオブジェクト) ごとの部品に分ける。
+// 部品は Blender の位置と角度のまま置く。peekScreen カメラがあれば、スクリーンをその位置に合わせる
+fn split_world(layout: &mut SceneLayout, id: u64, info: &ModelInfo) {
+    let Some(index) = layout.objects.iter().position(|o| o.id == id) else {
+        return;
+    };
+    let Some(path) = layout.objects[index].model().map(|m| m.path.clone()) else {
+        return;
+    };
+    if let Some(screen) = info.screen {
+        layout.screen = Placement::from_transform(&screen);
     }
-
-    let wall_color = materials.add(Color::srgb(0.4, 0.4, 0.45));
-
-    // 背面の壁(奥行きの終端を示す)
-    commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(room_half_width * 2.0, room_height, 0.02))),
-        MeshMaterial3d(wall_color.clone()),
-        Transform::from_xyz(0.0, FLOOR_Y + room_height * 0.5, wall_z),
-        RoomPart,
-    ));
-
-    // 左の壁
-    commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(0.02, room_height, room_depth))),
-        MeshMaterial3d(wall_color.clone()),
-        Transform::from_xyz(-room_half_width, FLOOR_Y + room_height * 0.5, center_z),
-        RoomPart,
-    ));
-
-    // 右の壁
-    commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(0.02, room_height, room_depth))),
-        MeshMaterial3d(wall_color),
-        Transform::from_xyz(room_half_width, FLOOR_Y + room_height * 0.5, center_z),
-        RoomPart,
-    ));
-
-    // 天井
-    commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(room_half_width * 2.0, 0.02, room_depth))),
-        MeshMaterial3d(materials.add(Color::srgb(0.5, 0.5, 0.55))),
-        Transform::from_xyz(0.0, ceiling_y, center_z),
-        RoomPart,
-    ));
+    if info.nodes.is_empty() {
+        // 分けられるノードが無ければ、丸ごと1つのオブジェクトのままにする
+        layout.objects[index].on_load = None;
+        return;
+    }
+    let world = layout.objects.remove(index);
+    for node in &info.nodes {
+        layout.add_object(
+            &node.name,
+            ObjectKind::Model(Model::part(&path, &node.name)),
+            Placement::from_transform(&node.original),
+        );
+    }
+    info!(
+        "{} を {} 個のオブジェクトに分けました{}",
+        world.name,
+        info.nodes.len(),
+        if info.screen.is_some() { "。スクリーンを peekScreen カメラに合わせました" } else { "" }
+    );
 }

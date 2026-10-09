@@ -5,5 +5,6 @@ pub mod scene;
 pub mod package;
 pub mod library;
 pub mod model;
+pub mod default_room;
 pub mod highlight;
 pub mod package_store;

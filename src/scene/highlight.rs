@@ -7,7 +7,6 @@ use bevy_mod_outline::{InheritOutline, OutlineMode, OutlinePlugin, OutlineRender
 use crate::app_mode::AppMode;
 use crate::camera::scene_view::GIZMO_LAYER;
 use crate::scene::editor::{EditState, Selection};
-use crate::scene::model::LoadedModels;
 use crate::scene::scene::Placeable;
 
 // 選択の色 (Blender の選択に近いオレンジ)
@@ -32,7 +31,6 @@ impl Plugin for HighlightPlugin {
 fn selected_entity(
     mode: &State<AppMode>,
     state: &EditState,
-    models: &LoadedModels,
     placeables: &Query<(Entity, &Placeable)>,
 ) -> Option<Entity> {
     if *mode.get() != AppMode::Edit {
@@ -40,8 +38,7 @@ fn selected_entity(
     }
     match state.selection.as_ref()? {
         Selection::Object(id) => placeables.iter().find(|(_, p)| p.0 == *id).map(|(e, _)| e),
-        Selection::Node { object, name } => models.get(*object)?.node(name).map(|n| n.entity),
-        Selection::Screen | Selection::Light | Selection::Room => None,
+        Selection::Screen | Selection::Light => None,
     }
 }
 
@@ -51,13 +48,12 @@ fn update_outline(
     mut commands: Commands,
     mode: Res<State<AppMode>>,
     state: Res<EditState>,
-    models: Res<LoadedModels>,
     placeables: Query<(Entity, &Placeable)>,
     children: Query<&Children>,
     outlined: Query<Entity, With<Outlined>>,
     inherits: Query<(), With<InheritOutline>>,
 ) {
-    let target = selected_entity(&mode, &state, &models, &placeables);
+    let target = selected_entity(&mode, &state, &placeables);
 
     // 前に選んでいたものの輪郭線を外す
     for entity in &outlined {

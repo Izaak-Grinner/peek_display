@@ -9,12 +9,13 @@ use crate::app_mode::{AppMode, EditViewInsets};
 use crate::camera::camera_preview::CameraPreview;
 use crate::config::{ARUCO_MARKER_SIZE_CM, AppConfig, DisplayInfo};
 use crate::scene::editor::{EditState, Pending, SaveAsDialog, SaveStatus, Selection};
-use crate::scene::import::ImportState;
+use crate::scene::default_room;
+use crate::scene::import::{ImportKind, ImportState};
 use crate::scene::layout::{ObjectKind, Placement, SceneLayout, SceneObject};
 use crate::scene::library::{self, SceneLibrary};
-use crate::scene::package::{PackageFiles, PackageMessage, PackageState};
+use crate::scene::package::{PackageMessage, PackageState};
 use crate::scene::package_store::PackageStore;
-use crate::scene::model::{self, LoadedModels, ModelInfo, NodeInfo, ReloadRequest};
+use crate::scene::model::{self, LoadedModels, ModelInfo};
 
 const PANEL_WIDTH: f32 = 330.0;
 const MENU_BAR_HEIGHT: f32 = 28.0;
@@ -33,7 +34,7 @@ const DUPLICATE_OFFSET: Vec3 = Vec3::new(0.05, 0.0, 0.0);
 
 // 編集モードの操作方法。メニューの「ヘルプ → 操作方法」にまとめて出す
 const HELP_ROWS: [(&str, &str); 19] = [
-    ("左クリック", "オブジェクトを選択(一覧かシーンビュー。選んだモデルをもう一度クリックすると中のオブジェクトを選択。壁や床で選択を外す)"),
+    ("左クリック", "オブジェクトを選択(一覧かシーンビュー)"),
     ("右ドラッグ / ホイール", "視点の回転 / ズーム"),
     ("ホイールを押しながらドラッグ", "視点の平行移動"),
     ("矢印キー", "移動(↑↓ = Z軸、←→ = X軸)"),
@@ -45,7 +46,7 @@ const HELP_ROWS: [(&str, &str); 19] = [
     ("Shift を押しながら", "ゆっくり動かす(速さ1/10)"),
     ("Ctrl+Z / Ctrl+Shift+Z", "元に戻す / やり直し (Ctrl+Y でもやり直し)"),
     ("Ctrl+D", "選択中のオブジェクトを複製"),
-    ("Delete", "選択中のオブジェクトを削除(モデルの中のオブジェクトは非表示に切り替え)"),
+    ("Delete", "選択中のオブジェクトを削除"),
     ("Ctrl+N", "新規シーン"),
     ("Ctrl+S / Ctrl+Shift+S", "保存 / 名前を付けて保存"),
     ("Esc", "ホームへ戻る / ダイアログを閉じる"),
@@ -77,20 +78,14 @@ enum Action {
     Undo,
     Redo,
     ExportScene,
-    ImportModel,
-    // モデルを元のファイルから読み直す
-    ReloadModel(u64),
+    Import(ImportKind),
     OpenScenesFolder,
-    // モデルの中のノードの表示・非表示を切り替える
-    ToggleNodeHidden(u64, String),
-    // モデルの中のノードを Blender の値に戻す
-    ResetNode(u64, String),
-    // スクリーンを、モデルの中の screen カメラの位置に合わせる
+    // ワールドの部品を Blender の位置・角度に戻す
+    ResetToBlender(u64),
+    // スクリーンを、モデルの中の peekScreen カメラの位置に合わせる
     FitScreen,
     // ライトを初期値に戻す
     ResetLight,
-    // 部屋の表示・非表示を切り替える
-    ToggleRoom,
     // 今の画面を、シーンの基準の画面にする
     SetReference,
     // 保存してあるシーンの削除 (確認ダイアログを出す → 削除する / やめる)
@@ -114,7 +109,6 @@ pub fn edit_panel(
     mut package: ResMut<PackageState>,
     mut store: ResMut<PackageStore>,
     models: Res<LoadedModels>,
-    mut reload: ResMut<ReloadRequest>,
     display: Res<DisplayInfo>,
     mut insets: ResMut<EditViewInsets>,
     mut next: ResMut<NextState<AppMode>>,
@@ -245,10 +239,6 @@ pub fn edit_panel(
                     } else if keyboard.just_pressed(KeyCode::Delete) {
                         action = Some(Action::AskDelete(id));
                     }
-                } else if let Some(Selection::Node { object, name }) = &state.selection {
-                    if keyboard.just_pressed(KeyCode::Delete) {
-                        action = Some(Action::ToggleNodeHidden(*object, name.clone()));
-                    }
                 }
             }
         }
@@ -289,27 +279,18 @@ pub fn edit_panel(
                 let name = files.library.current.clone().unwrap_or_else(|| files.library.suggested_name.clone());
                 files.package.start_export(files.layout, files.store.files(), &name);
             }
-            Some(Action::ImportModel) => {
+            Some(Action::Import(kind)) => {
                 files.state.import_error = None;
-                files.import.start();
+                files.import.start(kind);
             }
-            Some(Action::ReloadModel(id)) => reload.0 = Some(id),
             Some(Action::OpenScenesFolder) => open_scenes_folder(),
-            Some(Action::ToggleNodeHidden(id, name)) => {
-                if let Some(model) = files.layout.object_mut(id).and_then(|o| o.model_mut()) {
-                    let node = model.node_mut(&name);
-                    node.hidden = !node.hidden;
-                    model.prune_nodes();
-                }
-            }
-            Some(Action::ResetNode(id, name)) => {
-                if let Some(model) = files.layout.object_mut(id).and_then(|o| o.model_mut()) {
-                    model.node_mut(&name).placement = None;
-                    model.prune_nodes();
+            Some(Action::ResetToBlender(id)) => {
+                let placement = models.get(id).and_then(|info| info.part_placement());
+                if let (Some(object), Some(placement)) = (files.layout.object_mut(id), placement) {
+                    object.placement = placement;
                 }
             }
             Some(Action::ResetLight) => files.layout.light = Default::default(),
-            Some(Action::ToggleRoom) => files.layout.show_room = !files.layout.show_room,
             Some(Action::SetReference) => files.layout.reference = Some(files.display.size),
             Some(Action::AskDeleteScene(name)) => files.state.confirm_delete_scene = Some(name),
             Some(Action::DeleteScene(name)) => files.delete_scene(&name),
@@ -327,17 +308,16 @@ pub fn edit_panel(
                     };
                     let name = format!("{}_copy", source.name);
                     let new_id = files.layout.add_object(&name, source.kind, placement);
+                    if let Some(copy) = files.layout.object_mut(new_id) {
+                        copy.selectable = source.selectable;
+                    }
                     files.state.selection = Some(Selection::Object(new_id));
                 }
             }
             Some(Action::AskDelete(id)) => files.state.confirm_delete = Some(id),
             Some(Action::Delete(id)) => {
                 files.layout.objects.retain(|o| o.id != id);
-                let selected = match &files.state.selection {
-                    Some(Selection::Object(s)) | Some(Selection::Node { object: s, .. }) => *s == id,
-                    _ => false,
-                };
-                if selected {
+                if files.state.selection == Some(Selection::Object(id)) {
                     files.state.selection = None;
                 }
                 files.state.confirm_delete = None;
@@ -390,9 +370,10 @@ impl FileContext<'_> {
         match pending {
             Pending::Exit => self.next.set(AppMode::Home),
             Pending::New => {
-                self.layout.replace_with(SceneLayout::empty());
+                let (layout, files) = default_room::new_scene();
+                self.layout.replace_with(layout);
                 self.layout.reference = Some(self.display.size);
-                self.store.replace(PackageFiles::new());
+                self.store.replace(files);
                 *self.library = SceneLibrary::untitled(NEW_SCENE_NAME);
                 self.state.scene_switched(self.layout);
             }
@@ -559,8 +540,17 @@ fn menu_bar(
             ui.separator();
             ui.menu_button("インポート", |ui| {
                 ui.set_min_width(220.0);
-                if ui.add_enabled(!import.busy(), egui::Button::new("モデル (.glb / .gltf)…")).clicked() {
-                    set(Action::ImportModel);
+                let world = ui
+                    .add_enabled(!import.busy(), egui::Button::new("ワールド (.glb / .gltf)…"))
+                    .on_hover_text("Blender で作ったワールド。親を持たないオブジェクトごとに分けて、Blender の位置のまま置きます");
+                if world.clicked() {
+                    set(Action::Import(ImportKind::World));
+                }
+                let model = ui
+                    .add_enabled(!import.busy(), egui::Button::new("モデル (.glb / .gltf)…"))
+                    .on_hover_text("ひとかたまりのモデル。スクリーンの正面に、約30cmの大きさで置きます");
+                if model.clicked() {
+                    set(Action::Import(ImportKind::Model));
                 }
                 if ui.add_enabled(!package.busy(), egui::Button::new("シーン (.peek)…")).clicked() {
                     set(Action::Request(Pending::ImportScene));
@@ -609,17 +599,18 @@ fn menu_bar(
     });
 }
 
-fn kind_label(kind: &ObjectKind) -> &'static str {
-    match kind {
-        ObjectKind::Model(_) => "モデル",
-        ObjectKind::Cube { .. } => "キューブ",
-    }
-}
-
-fn kind_icon(kind: &ObjectKind) -> (Icon, Color32) {
-    match kind {
-        ObjectKind::Model(_) => (Icon::Model, ICON_MODEL),
-        ObjectKind::Cube { .. } => (Icon::Cube, ICON_CUBE),
+// オブジェクトの種類の名前とアイコン。ワールドの部品は、ライトが入っていれば「ライト」とする
+fn object_kind(object: &SceneObject, info: Option<&ModelInfo>) -> (&'static str, Icon, Color32) {
+    match &object.kind {
+        ObjectKind::Model(model) if model.node.is_some() => {
+            if info.is_some_and(|info| info.has_lights) {
+                ("ライト", Icon::Sun, ICON_LIGHT)
+            } else {
+                ("ワールド", Icon::Model, ICON_MODEL)
+            }
+        }
+        ObjectKind::Model(_) => ("モデル", Icon::Model, ICON_MODEL),
+        ObjectKind::Cube { .. } => ("キューブ", Icon::Cube, ICON_CUBE),
     }
 }
 
@@ -777,7 +768,7 @@ fn scene_section(
     models: &LoadedModels,
     action: &mut Option<Action>,
 ) {
-    let count = (layout.objects.len() + 3).to_string();
+    let count = (layout.objects.len() + 2).to_string();
     widgets::section_header(ui, "シーン", Some(count), |_| {});
     package_status(ui, package);
 
@@ -862,15 +853,10 @@ fn scene_list(
         state.selection = Some(Selection::Screen);
     }
 
-    widgets::group_label(ui, "環境", 8.0);
+    widgets::group_label(ui, "照明", 8.0);
     let selected = state.selection == Some(Selection::Light);
     if widgets::list_row(ui, selected, Icon::Sun, ICON_LIGHT, "ライト", "太陽光・環境光").clicked() {
         state.selection = Some(Selection::Light);
-    }
-    let selected = state.selection == Some(Selection::Room);
-    let tag = if layout.show_room { "床と壁" } else { "非表示" };
-    if widgets::list_row(ui, selected, Icon::Cube, ICON_CUBE, "部屋", tag).clicked() {
-        state.selection = Some(Selection::Room);
     }
 
     widgets::group_label(ui, "オブジェクト", 8.0);
@@ -881,7 +867,7 @@ fn scene_list(
         model::SCREEN_NODE
     ));
     if add.clicked() {
-        *action = Some(Action::ImportModel);
+        *action = Some(Action::Import(ImportKind::Model));
     }
     if let Some(error) = &state.import_error {
         ui.add_space(4.0);
@@ -898,29 +884,10 @@ fn scene_list(
     ui.add_space(2.0);
     for object in &layout.objects {
         let selected = state.selection == Some(Selection::Object(object.id));
-        let (icon, icon_color) = kind_icon(&object.kind);
-        if widgets::list_row(ui, selected, icon, icon_color, &object.name, kind_label(&object.kind)).clicked() {
+        let (kind, icon, icon_color) = object_kind(object, models.get(object.id));
+        let tag = if object.selectable { kind } else { "クリック除外" };
+        if widgets::list_row(ui, selected, icon, icon_color, &object.name, tag).clicked() {
             state.selection = Some(Selection::Object(object.id));
-        }
-
-        // 選んでいるモデルは、中のノードも並べる
-        let (Some(model), Some(info)) = (object.model(), models.get(object.id)) else {
-            continue;
-        };
-        let open = match &state.selection {
-            Some(Selection::Object(id)) | Some(Selection::Node { object: id, .. }) => *id == object.id,
-            _ => false,
-        };
-        if !open || !info.lists_nodes() {
-            continue;
-        }
-        for node in &info.nodes {
-            let row = Selection::Node { object: object.id, name: node.name.clone() };
-            let selected = state.selection.as_ref() == Some(&row);
-            let tag = if model::node_hidden(model, &node.name) { "非表示" } else { "" };
-            if widgets::child_row(ui, selected, Icon::Model, ICON_MODEL, &node.name, tag).clicked() {
-                state.selection = Some(row);
-            }
         }
     }
 }
@@ -970,13 +937,6 @@ fn properties(
         match state.selection.clone() {
             Some(Selection::Screen) => screen_properties(ui, layout, config, models, display, panel, action),
             Some(Selection::Light) => light_properties(ui, layout, models, action),
-            Some(Selection::Room) => room_properties(ui, layout, action),
-            Some(Selection::Node { object, name }) => {
-                match models.get(object).and_then(|info| Some((info, info.node(&name)?))) {
-                    Some((info, node)) => node_properties(ui, layout, object, info, node, action),
-                    None => nothing_selected(ui, state),
-                }
-            }
             Some(Selection::Object(id)) => match layout.object_mut(id) {
                 Some(object) => object_properties(ui, object, models.get(id), action),
                 None => nothing_selected(ui, state),
@@ -1073,100 +1033,17 @@ fn light_properties(ui: &mut Ui, layout: &mut SceneLayout, models: &LoadedModels
     }
 }
 
-// アプリが作る部屋 (床と壁)
-fn room_properties(ui: &mut Ui, layout: &SceneLayout, action: &mut Option<Action>) {
-    identity(ui, Icon::Cube, ICON_CUBE, |ui| {
-        ui.label(RichText::new("部屋").size(13.0).color(TEXT_STRONG));
-        ui.label(RichText::new("アプリが置く床（チェッカー模様）と壁").size(10.5).color(TEXT_MUTED));
-    });
-    let label = if layout.show_room { "非表示にする" } else { "表示する" };
-    if Button::new(label, widgets::BUTTON).width(ui.available_width()).show(ui).clicked() {
-        *action = Some(Action::ToggleRoom);
-    }
-    widgets::wrapped_label(
-        ui,
-        &format!(
-            "Blender で作った部屋を使うときは非表示にします。{} カメラの入ったモデルをインポートすると、自動で非表示になります。",
-            model::SCREEN_NODE
-        ),
-        10.5,
-        TEXT_HINT,
-    );
-}
-
-// モデルの中のノード。触っていなければ Blender の値を出し、値を変えたら変更として記録する
-fn node_properties(
-    ui: &mut Ui,
-    layout: &mut SceneLayout,
-    object_id: u64,
-    info: &ModelInfo,
-    node: &NodeInfo,
-    action: &mut Option<Action>,
-) {
-    let Some(object) = layout.object_mut(object_id) else {
-        return;
-    };
-    let object_name = object.name.clone();
-    let Some(model) = object.model_mut() else {
-        return;
-    };
-    let hidden = model::node_hidden(model, &node.name);
-    let changed = model.node(&node.name).is_some_and(|n| n.placement.is_some());
-    identity(ui, Icon::Model, ICON_MODEL, |ui| {
-        ui.label(RichText::new(&node.name).size(13.0).color(TEXT_STRONG));
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            kind_chip(ui, &format!("{} の中", object_name), ICON_MODEL);
-            let note = match (changed, hidden) {
-                (_, true) => "非表示",
-                (true, false) => "アプリで変更",
-                (false, false) => "Blender の値",
-            };
-            ui.label(RichText::new(note).size(10.5).color(TEXT_HINT));
-        });
-    });
-
-    let Some(before) = model::node_placement(model, info, &node.name) else {
-        return;
-    };
-    let mut placement = before.clone();
-    placement_editor(ui, &mut placement, true);
-    if placement != before {
-        model.node_mut(&node.name).placement = Some(placement);
-    }
-    widgets::wrapped_label(
-        ui,
-        "位置と回転はモデルの中の座標です。大きさは Blender での大きさに掛ける倍率です。",
-        10.5,
-        TEXT_HINT,
-    );
-
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 6.0;
-        let width = (ui.available_width() - 6.0) / 2.0;
-        let label = if hidden { "表示する" } else { "非表示にする" };
-        if Button::new(label, widgets::BUTTON).width(width).show(ui).clicked() {
-            *action = Some(Action::ToggleNodeHidden(object_id, node.name.clone()));
-        }
-        if Button::new("Blender の値に戻す", widgets::BUTTON)
-            .width(width)
-            .enabled(changed)
-            .show(ui)
-            .clicked()
-        {
-            *action = Some(Action::ResetNode(object_id, node.name.clone()));
-        }
-    });
-}
-
 fn object_properties(ui: &mut Ui, object: &mut SceneObject, info: Option<&ModelInfo>, action: &mut Option<Action>) {
-    let (icon, icon_color) = kind_icon(&object.kind);
-    let detail = object.model().map(|m| m.path.clone());
+    let (kind, icon, icon_color) = object_kind(object, info);
+    let detail = object.model().map(|m| match &m.node {
+        Some(node) => format!("{} › {}", m.path, node),
+        None => m.path.clone(),
+    });
     identity(ui, icon, icon_color, |ui| {
         name_edit(ui, &mut object.name, object.id);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            kind_chip(ui, kind_label(&object.kind), icon_color);
+            kind_chip(ui, kind, icon_color);
             if let Some(path) = &detail {
                 let galley = widgets::truncated_text(ui, path, 10.5, TEXT_HINT, ui.available_width());
                 ui.label(galley).on_hover_text(path);
@@ -1175,6 +1052,9 @@ fn object_properties(ui: &mut Ui, object: &mut SceneObject, info: Option<&ModelI
     });
 
     placement_editor(ui, &mut object.placement, true);
+
+    ui.checkbox(&mut object.selectable, "シーンビューのクリックで選ぶ")
+        .on_hover_text("外すと、クリックが後ろのものに届きます (床や壁を誤って選ばないように)。一覧からは選べます");
 
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
@@ -1195,33 +1075,18 @@ fn object_properties(ui: &mut Ui, object: &mut SceneObject, info: Option<&ModelI
         }
     });
 
-    let Some(model) = object.model() else {
-        return;
-    };
-    if info.is_some_and(|info| info.lists_nodes()) {
-        widgets::wrapped_label(
-            ui,
-            "中のオブジェクトは、一覧で選ぶか、シーンビューでもう一度クリックすると個別に動かせます。",
-            10.5,
-            TEXT_HINT,
-        );
-    }
-    // 元のファイルの場所が分かるモデルだけ (共有を受けたシーンなどでは押せない)
-    let can_reload = model.source.as_deref().is_some_and(|s| std::path::Path::new(s).is_file());
-    let hint = match &model.source {
-        Some(source) if can_reload => format!("{} から読み直します (Blender で書き出し直したとき)", source),
-        Some(source) => format!("元のファイル {} が見つかりません", source),
-        None => "元のファイルの場所が分かりません".to_string(),
-    };
-    if Button::new("元のファイルから再読み込み", widgets::BUTTON)
-        .width(ui.available_width())
-        .enabled(can_reload)
-        .show(ui)
-        .on_hover_text(&hint)
-        .on_disabled_hover_text(hint)
-        .clicked()
-    {
-        *action = Some(Action::ReloadModel(object.id));
+    // ワールドの部品は、Blender の位置・角度に戻せる
+    if let Some(original) = info.and_then(|info| info.part_placement()) {
+        let changed = object.placement != original;
+        if Button::new("Blender の値に戻す", widgets::BUTTON)
+            .width(ui.available_width())
+            .enabled(changed)
+            .show(ui)
+            .on_hover_text("位置・角度を Blender での値に、大きさを ×1 に戻す")
+            .clicked()
+        {
+            *action = Some(Action::ResetToBlender(object.id));
+        }
     }
 }
 
@@ -1366,7 +1231,7 @@ fn screen_properties(
     });
 
     placement_editor(ui, &mut layout.screen, false);
-    // モデルに screen カメラがあれば、その位置に合わせられる
+    // モデルに peekScreen カメラがあれば、その位置に合わせられる
     if let Some((name, placement)) = models.screen_placement(layout) {
         let fit = Button::new(&format!("「{}」の {} カメラに合わせる", name, model::SCREEN_NODE), widgets::BUTTON)
             .width(ui.available_width())
@@ -1496,15 +1361,17 @@ fn screen_properties(
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing = vec2(GAP, 6.0);
         let mut open = !panel.tracking_closed;
-        let summary = format!("マーカー {:.1} cm · 視野角 {:.0}°", config.marker_size_cm, config.camera_fov_deg);
+        let summary = format!("マーカーの大きさ {:.1} cm · 視野角 {:.0}°", config.marker_size_cm, config.camera_fov_deg);
         widgets::collapsing_header(ui, &mut open, "トラッキング", &summary);
         panel.tracking_closed = !open;
         if !open {
             return;
         }
 
+        // 「マーカーの大きさ」が入るように、ほかの欄よりラベルを広くとる
+        const TRACKING_LABEL: f32 = 100.0;
         ui.horizontal(|ui| {
-            widgets::fixed_label(ui, LABEL, 24.0, "マーカー", 12.0, TEXT_LABEL, Align::Min);
+            widgets::fixed_label(ui, TRACKING_LABEL, 24.0, "マーカーの大きさ", 12.0, TEXT_LABEL, Align::Min);
             NumberField::new(&mut config.marker_size_cm, 0.1, 1)
                 .unit("cm")
                 .range(0.5..=50.0)
@@ -1524,25 +1391,16 @@ fn screen_properties(
             );
         }
         ui.horizontal(|ui| {
-            widgets::fixed_label(ui, LABEL, 24.0, "視野角", 12.0, TEXT_LABEL, Align::Min);
+            widgets::fixed_label(ui, TRACKING_LABEL, 24.0, "視野角", 12.0, TEXT_LABEL, Align::Min);
             NumberField::new(&mut config.camera_fov_deg, 1.0, 0)
                 .unit("°")
                 .range(10.0..=170.0)
                 .show(ui, ui.available_width())
                 .on_hover_text("カメラの対角の視野角。OpenTrack が距離の計算に使う (初期値 56°)");
         });
-        ui.horizontal(|ui| {
-            widgets::fixed_label(ui, LABEL, 24.0, "カメラ", 12.0, TEXT_LABEL, Align::Min);
-            ui.add(
-                egui::TextEdit::singleline(&mut config.opentrack_camera)
-                    .hint_text("空なら OpenTrack の設定のまま")
-                    .desired_width(ui.available_width()),
-            )
-            .on_hover_text("OpenTrack で使うカメラの名前。OpenTrack の画面に出る名前をそのまま入れる");
-        });
         widgets::wrapped_label(
             ui,
-            "視野角とカメラは、保存すると OpenTrack に書き込み、OpenTrack を起動し直します（数秒トラッキングが止まります）。",
+            "視野角は、保存すると OpenTrack に書き込み、OpenTrack を起動し直します（数秒トラッキングが止まります）。",
             10.5,
             TEXT_HINT,
         );

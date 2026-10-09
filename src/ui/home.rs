@@ -2,13 +2,24 @@ use bevy::prelude::*;
 use bevy_egui::{EguiContexts, egui};
 
 use crate::app_mode::AppMode;
+use crate::scene::editor::EditState;
+use crate::scene::layout::SceneLayout;
+use crate::scene::library::{self, SceneLibrary};
+use crate::scene::package_store::PackageStore;
 
 const BUTTON_SIZE: egui::Vec2 = egui::vec2(320.0, 56.0);
 
+#[allow(clippy::too_many_arguments)]
 pub fn home_ui(
     mut contexts: EguiContexts,
     mut next: ResMut<NextState<AppMode>>,
     mut exit: MessageWriter<AppExit>,
+    mut library: ResMut<SceneLibrary>,
+    mut layout: ResMut<SceneLayout>,
+    mut store: ResMut<PackageStore>,
+    mut state: ResMut<EditState>,
+    // シーンを開けなかった理由
+    mut open_error: Local<Option<String>>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
     egui::CentralPanel::default()
@@ -23,6 +34,38 @@ pub fn home_ui(
                         ui.vertical_centered(|ui| {
                             ui.heading(egui::RichText::new("のぞけるディスプレイ").size(28.0));
                             ui.add_space(16.0);
+
+                            // 表示するシーン。選んだシーンを開き、どのモードでもそれを使う
+                            // (ホームでは未保存の変更は無い。編集モードから戻るときに保存するか捨てている)
+                            ui.horizontal(|ui| {
+                                ui.label("シーン");
+                                let current = library.current.clone();
+                                egui::ComboBox::from_id_salt("home_scene")
+                                    .width(ui.available_width())
+                                    .selected_text(current.as_deref().unwrap_or("（未保存のシーン）"))
+                                    .show_ui(ui, |ui| {
+                                        for name in library::list() {
+                                            let selected = current.as_deref() == Some(name.as_str());
+                                            if ui.selectable_label(selected, &name).clicked() && !selected {
+                                                match library.open_scene(&name, &mut store) {
+                                                    Ok(loaded) => {
+                                                        layout.replace_with(loaded);
+                                                        state.scene_switched(&layout);
+                                                        *open_error = None;
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("{}", e);
+                                                        *open_error = Some(e);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    });
+                            });
+                            if let Some(e) = open_error.as_ref() {
+                                ui.colored_label(egui::Color32::from_rgb(0xff, 0x8f, 0x8f), e);
+                            }
+                            ui.add_space(12.0);
 
                             let mut mode_button = |ui: &mut egui::Ui, label: &str, detail: &str, mode| {
                                 let text = egui::RichText::new(label).size(20.0);
