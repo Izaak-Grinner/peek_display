@@ -1,4 +1,7 @@
-use bevy::{picking::mesh_picking::MeshPickingPlugin, prelude::*};
+// 配布用ビルド (dev feature なし) では、ログを流すコンソールを出さない。問題は画面とダイアログで知らせる (ui/problems.rs)
+#![cfg_attr(not(feature = "dev"), windows_subsystem = "windows")]
+
+use bevy::{log::LogPlugin, picking::mesh_picking::MeshPickingPlugin, prelude::*};
 
 mod app_mode;
 mod camera;
@@ -8,16 +11,24 @@ mod tracking;
 mod ui;
 
 fn main() {
+    ui::problems::install_panic_dialog();
     let mut app = App::new();
     // シーンの中のファイルの読み込み元は、DefaultPlugins より前に登録する
     let mut store = scene::package_store::PackageStore::register(&mut app);
+    app.add_plugins((
+        DefaultPlugins.set(LogPlugin {
+            custom_layer: ui::problems::log_layer,
+            ..default()
+        }),
+        MeshPickingPlugin,
+    ));
+    // ログの準備ができてから読み込む (読めなかったときの警告を画面に出すため)
     let (library, layout, files) = scene::library::SceneLibrary::open();
     store.replace(files);
     app.insert_resource(config::AppConfig::load())
         .insert_resource(store)
         .insert_resource(library)
         .insert_resource(layout)
-        .add_plugins((DefaultPlugins, MeshPickingPlugin))
         .add_plugins((
             app_mode::AppModePlugin,
             config::DisplayPlugin,

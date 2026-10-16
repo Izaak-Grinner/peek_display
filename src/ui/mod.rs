@@ -12,6 +12,7 @@ use crate::app_mode::AppMode;
 
 pub mod edit_panel;
 pub mod home;
+pub mod problems;
 mod widgets;
 
 // 日本語を表示するためのフォント (上から順に、見つかったものを使う)
@@ -34,6 +35,8 @@ impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(EguiPlugin::default())
             .init_resource::<UiInputState>()
+            .init_resource::<problems::Problems>()
+            .add_systems(Update, problems::collect_problems)
             .add_systems(Startup, setup_ui_camera)
             .add_systems(
                 EguiPrimaryContextPass,
@@ -42,6 +45,7 @@ impl Plugin for UiPlugin {
                     home::home_ui.run_if(in_state(AppMode::Home)),
                     inspection_overlay.run_if(in_state(AppMode::Inspection)),
                     edit_panel::edit_panel.run_if(in_state(AppMode::Edit)),
+                    problems::problems_ui,
                     update_ui_input_state,
                 )
                     .chain(),
@@ -98,6 +102,7 @@ fn setup_fonts(mut contexts: EguiContexts) -> Result {
 fn inspection_overlay(
     mut contexts: EguiContexts,
     pose: Res<crate::tracking::tracking::HeadPose>,
+    stats: Res<crate::tracking::tracking::TrackingStats>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
     egui::Area::new(egui::Id::new("inspection_overlay"))
@@ -111,6 +116,24 @@ fn inspection_overlay(
                     "頭の位置 (cm): x {:.1}  y {:.1}  z {:.1}",
                     pose.x, pose.y, pose.z
                 ));
+                ui.separator();
+                ui.label(format!("アプリ: {:.0} fps", stats.fps));
+                ui.label(format!("OpenTrack から: {:.0} 回/秒", stats.received_per_second));
+                match stats.last_received {
+                    Some(at) => {
+                        let ms = at.elapsed().as_millis();
+                        let text = format!("最後に届いてから: {} ms", ms);
+                        // 0.5 秒以上届いていなければ、OpenTrack のトラッキングが止まっている (マーカーを見失っても送り続けるので、それとは別)
+                        if ms >= 500 {
+                            ui.colored_label(egui::Color32::from_rgb(0xf0, 0xb0, 0x5a), text);
+                        } else {
+                            ui.label(text);
+                        }
+                    }
+                    None => {
+                        ui.colored_label(egui::Color32::from_rgb(0xf0, 0xb0, 0x5a), "OpenTrack からまだ届いていません");
+                    }
+                }
                 ui.label("Esc: ホームへ戻る");
             });
         });

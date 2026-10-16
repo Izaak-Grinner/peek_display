@@ -28,7 +28,7 @@ https://github.com/opentrack/opentrack/blob/unstable/contrib/aruco/test3.png を
 | camera_fov_deg | カメラの対角の視野角（度、初期値 56） |
 | marker_size_cm | 印刷したマーカーの一辺（cm、初期値 4） |
 
-アプリは起動のたびに、OpenTrack のプロファイル（ドキュメント\opentrack-2.3\display.ini）に、アプリの前提の値（aruco トラッカー、UDP 出力、センター合わせ C、開始 F12、動きの範囲）と、上の視野角を書き込む。視野角を編集モードで変えて保存すると、OpenTrack を起動し直す。使うカメラは OpenTrack の画面で選ぶ。
+アプリは起動のたびに、OpenTrack のプロファイル（ドキュメント\opentrack-2.3\display.ini）に、アプリの前提の値（aruco トラッカー、UDP 出力、センター合わせ C、開始 F12、動きの範囲）と、上の視野角を書き込み、OpenTrack が使うプロファイルをこの display に切り替えてから起動する（OpenTrack の画面でほかのプロファイルを選んでいても、次の起動で display に戻る）。視野角を編集モードで変えて保存すると、OpenTrack を起動し直す。使うカメラは OpenTrack の画面で選ぶ。
 
 ## 使い方
 

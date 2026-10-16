@@ -20,10 +20,66 @@ const AUTO_START_FIRST_DELAY: Duration = Duration::from_secs(3);
 const AUTO_START_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const AUTO_START_TIMEOUT: Duration = Duration::from_secs(30);
 
+// アプリが書き込み、OpenTrack に使わせるプロファイル (ドキュメント\opentrack-2.3\display.ini)
+const PROFILE_FILE_NAME: &str = "display.ini";
+
 fn opentrack_profile_path() -> Option<PathBuf> {
-    let profile = std::env::var("USERPROFILE").ok()?;
-    Some(PathBuf::from(profile).join(r"Documents\opentrack-2.3\display.ini"))
+    Some(documents_dir()?.join("opentrack-2.3").join(PROFILE_FILE_NAME))
 }
+
+// ドキュメントフォルダ。OneDrive などでドキュメントを移している PC もあるので、
+// USERPROFILE\Documents と決めつけず、Windows に本当の場所を聞く (OpenTrack も同じ場所を使う)
+#[cfg(windows)]
+fn documents_dir() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_Documents, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+
+    let mut path: windows_sys::core::PWSTR = std::ptr::null_mut();
+    let result = unsafe { SHGetKnownFolderPath(&FOLDERID_Documents, KF_FLAG_DEFAULT as _, std::ptr::null_mut(), &mut path) };
+    let found = (result >= 0 && !path.is_null()).then(|| {
+        let len = (0..).take_while(|&i| unsafe { *path.add(i) } != 0).count();
+        let wide = unsafe { std::slice::from_raw_parts(path, len) };
+        PathBuf::from(std::ffi::OsString::from_wide(wide))
+    });
+    unsafe { CoTaskMemFree(path as _) };
+    found.or_else(|| std::env::var("USERPROFILE").ok().map(|p| PathBuf::from(p).join("Documents")))
+}
+
+#[cfg(not(windows))]
+fn documents_dir() -> Option<PathBuf> {
+    std::env::var("HOME").ok().map(|p| PathBuf::from(p).join("Documents"))
+}
+
+// OpenTrack が display.ini を使うようにする。OpenTrack はどのプロファイルを使うかをレジストリに覚えていて
+// (HKEY_CURRENT_USER\Software\opentrack-2.3\OrganizationDefaults の settings-filename)、
+// 初めて入れた PC では default.ini になっている。起動するときに読むので、起動する前に書く
+#[cfg(windows)]
+fn select_opentrack_profile() {
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegSetKeyValueW};
+
+    let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+    let key = wide(r"Software\opentrack-2.3\OrganizationDefaults");
+    let name = wide("settings-filename");
+    let value = wide(PROFILE_FILE_NAME);
+    // キーが無ければ作られる
+    let status = unsafe {
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            name.as_ptr(),
+            REG_SZ,
+            value.as_ptr() as _,
+            (value.len() * 2) as u32,
+        )
+    };
+    if status != 0 {
+        warn!("OpenTrack のプロファイルを {} に切り替えられませんでした (エラー {})", PROFILE_FILE_NAME, status);
+    }
+}
+
+#[cfg(not(windows))]
+fn select_opentrack_profile() {}
 
 // アプリが前提にする OpenTrack の設定 (どの機材でも同じ値にする)
 // UDP で 127.0.0.1:4242 に送る、センター合わせは C、開始は F12、動きの範囲は ±75cm (x・y は向きを反転)
@@ -53,8 +109,9 @@ const FIXED_PROFILE: &[(&str, &[(&str, &str)])] = &[
 // OpenTrack のプロファイルを、アプリの前提の値と機材プロファイルの値で書く。
 // ほかの項目 (OpenTrack の画面で変えたものなど) はそのまま残す
 fn ensure_opentrack_profile(config: &AppConfig) {
+    select_opentrack_profile();
     let Some(path) = opentrack_profile_path() else {
-        warn!("USERPROFILE を取得できず、OpenTrack のプロファイルを初期化できませんでした");
+        warn!("ドキュメントフォルダが分からず、OpenTrack のプロファイルを初期化できませんでした");
         return;
     };
 
@@ -215,6 +272,45 @@ pub struct UdpReceiver {
     pub socket: UdpSocket,
 }
 
+// 測る間隔 (この間の平均を出す)
+const STATS_WINDOW: Duration = Duration::from_secs(1);
+
+// OpenTrack から届いている様子と、アプリのフレームレート (検査モードに出す)
+#[derive(Resource, Default)]
+pub struct TrackingStats {
+    // 直近の1秒あたりのフレーム数
+    pub fps: f32,
+    // 直近の1秒あたりに OpenTrack から届いた回数 (フレームの間に届いて読み飛ばした分も数える)
+    pub received_per_second: f32,
+    // 最後に届いた時刻
+    pub last_received: Option<Instant>,
+    window_start: Option<Instant>,
+    window_frames: u32,
+    window_received: u32,
+}
+
+impl TrackingStats {
+    // 1フレーム分を数える。received: このフレームに届いた回数
+    fn record_frame(&mut self, received: u32) {
+        let now = Instant::now();
+        if received > 0 {
+            self.last_received = Some(now);
+        }
+        self.window_frames += 1;
+        self.window_received += received;
+        let start = *self.window_start.get_or_insert(now);
+        let elapsed = now.duration_since(start);
+        if elapsed >= STATS_WINDOW {
+            let secs = elapsed.as_secs_f32();
+            self.fps = self.window_frames as f32 / secs;
+            self.received_per_second = self.window_received as f32 / secs;
+            self.window_start = Some(now);
+            self.window_frames = 0;
+            self.window_received = 0;
+        }
+    }
+}
+
 #[derive(Resource, Default, Debug)]
 pub struct HeadPose {
     pub x: f32,
@@ -242,6 +338,7 @@ impl Plugin for TrackingPlugin {
         }
 
         app.init_resource::<HeadPose>()
+            .init_resource::<TrackingStats>()
             .add_systems(Startup, launch_opentrack)
             .add_systems(PreUpdate, receive_udp)
             .add_systems(
@@ -369,20 +466,25 @@ fn receive_udp(
     auto_start: Option<ResMut<AutoStart>>,
     config: Res<AppConfig>,
     mut pose: ResMut<HeadPose>,
+    mut stats: ResMut<TrackingStats>,
 ) {
     let Some(receiver) = receiver else {
+        stats.record_frame(0);
         return;
     };
 
     let mut buf = [0u8; 48];
     let mut latest_data = None;
+    let mut received = 0;
 
     // 非ブロックで最新のデータまで読み飛ばす（最新フレームのみ取得）
     while let Ok((len, _)) = receiver.socket.recv_from(&mut buf) {
         if len == 48 {
             latest_data = Some(buf);
+            received += 1;
         }
     }
+    stats.record_frame(received);
 
     if let Some(buf) = latest_data {
         // データが届いた = トラッキングが開始された
@@ -411,6 +513,13 @@ fn receive_udp(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ドキュメントフォルダが分かり、実在する
+    #[test]
+    fn documents_dir_exists() {
+        let dir = documents_dir().unwrap();
+        assert!(dir.is_dir(), "{}", dir.display());
+    }
 
     #[test]
     fn overwrites_existing_key_and_adds_missing_one() {
