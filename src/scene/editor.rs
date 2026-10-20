@@ -168,6 +168,18 @@ impl EditState {
         self.finish_save(result, layout, config)
     }
 
+    // 機材プロファイルの一部をその場で変えて、config.ini にすぐ保存する (検査モードの切り替えなど)。
+    // 書くのは保存済みの値にこの変更だけを加えたもので、編集モードのまだ保存していない変更は書かない
+    pub fn save_config_change(&mut self, config: &mut AppConfig, change: impl Fn(&mut AppConfig)) {
+        change(config);
+        let mut saved = self.saved_config.clone();
+        change(&mut saved);
+        match save_config(&saved) {
+            Ok(()) => self.saved_config = saved,
+            Err(e) => warn!("保存できませんでした: {}", e),
+        }
+    }
+
     fn finish_save(&mut self, result: Result<(), String>, layout: &SceneLayout, config: &AppConfig) -> bool {
         match result {
             Ok(()) => {

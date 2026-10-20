@@ -1,5 +1,6 @@
 // 起きた問題を画面に出す。
-// ログのうち、このアプリの警告と、すべてのエラーを拾って、画面の上に並べる (閉じるまで残す)。
+// ログのうち、このアプリの警告とエラーを拾って、画面の上に並べる (閉じるまで残す)。
+// Bevy や wgpu などのログは、使う人には関係ないことが多いので拾わない (動かなくなるものは異常終了のダイアログで出る)。
 // 異常終了 (panic) したときは、理由をダイアログで出す (配布用ビルドにはログを流すコンソールが無いため)
 use bevy::log::{
     BoxedLayer,
@@ -42,10 +43,9 @@ struct ProblemLayer;
 impl<S: Subscriber> Layer<S> for ProblemLayer {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
         let metadata = event.metadata();
-        // Bevy などの警告は使う人には関係ないことが多いので、このアプリのものだけにする
         let ours = metadata.target().starts_with(env!("CARGO_CRATE_NAME"));
         let level = *metadata.level();
-        if level != Level::ERROR && !(level == Level::WARN && ours) {
+        if !ours || (level != Level::ERROR && level != Level::WARN) {
             return;
         }
         let mut message = MessageVisitor(String::new());
@@ -128,14 +128,21 @@ pub fn problems_ui(mut contexts: EguiContexts, mut problems: ResMut<Problems>) -
                             } else {
                                 problem.message.clone()
                             };
-                            ui.add_sized(
-                                [CARD_WIDTH - 32.0, 0.0],
-                                egui::Label::new(
-                                    egui::RichText::new(text).size(12.0).color(egui::Color32::from_rgb(0xe3, 0xb2, 0xb2)),
-                                )
-                                .wrap(),
+                            // 左寄せで折り返す
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(CARD_WIDTH - 32.0, 0.0),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    ui.set_width(CARD_WIDTH - 32.0);
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(text).size(12.0).color(egui::Color32::from_rgb(0xe3, 0xb2, 0xb2)),
+                                        )
+                                        .wrap(),
+                                    );
+                                },
                             );
-                            if ui.small_button("✕").on_hover_text("閉じる").clicked() {
+                            if close_button(ui).on_hover_text("閉じる").clicked() {
                                 close = Some(i);
                             }
                         });
@@ -152,6 +159,20 @@ pub fn problems_ui(mut contexts: EguiContexts, mut problems: ResMut<Problems>) -
         problems.0.remove(i);
     }
     Ok(())
+}
+
+// 閉じるボタン (✕ は日本語フォントに無く □ になるので、線で描く)
+fn close_button(ui: &mut egui::Ui) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
+    let color = if response.hovered() { egui::Color32::WHITE } else { egui::Color32::from_gray(0xb0) };
+    if response.hovered() {
+        ui.painter().rect_filled(rect, 3.0_f32, egui::Color32::from_white_alpha(20));
+    }
+    let r = rect.shrink(6.0);
+    let stroke = egui::Stroke::new(1.5_f32, color);
+    ui.painter().line_segment([r.left_top(), r.right_bottom()], stroke);
+    ui.painter().line_segment([r.right_top(), r.left_bottom()], stroke);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 // 異常終了したときに、理由をダイアログで出す (メッセージは Ctrl+C でコピーできる)
@@ -193,8 +214,12 @@ mod tests {
             info!("拾わない情報");
             warn!("config.ini を作成できませんでした: {}", "テスト");
         });
+        bevy::log::tracing::subscriber::with_default(Registry::default().with(ProblemLayer), || {
+            bevy::log::tracing::error!(target: "wgpu_hal::vulkan", "拾わないほかのエラー");
+        });
         let pending = PENDING.lock().unwrap();
         assert!(pending.iter().any(|m| m == "config.ini を作成できませんでした: テスト"));
         assert!(!pending.iter().any(|m| m == "拾わない情報"));
+        assert!(!pending.iter().any(|m| m == "拾わないほかのエラー"));
     }
 }

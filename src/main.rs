@@ -11,6 +11,11 @@ mod tracking;
 mod ui;
 
 fn main() {
+    // ターミナルに出すログは config.ini の log_filter で決める。
+    // Bevy は RUST_LOG があればそちらを使うので、RUST_LOG を config.ini の値で上書きする
+    let log_filter = config::AppConfig::read_log_filter();
+    // SAFETY: ほかのスレッドを作る前 (main の最初) に1回だけ書き換える
+    unsafe { std::env::set_var("RUST_LOG", &log_filter) };
     ui::problems::install_panic_dialog();
     let mut app = App::new();
     // シーンの中のファイルの読み込み元は、DefaultPlugins より前に登録する

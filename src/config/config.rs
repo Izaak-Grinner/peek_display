@@ -1,3 +1,4 @@
+use bevy::log::tracing_subscriber::EnvFilter;
 use bevy::prelude::*;
 use std::fmt::Display;
 use std::io::Write;
@@ -12,6 +13,9 @@ const CONFIG_FILE_NAME: &str = "config.ini";
 // OpenTrack の aruco トラッカーが前提にしているマーカーの大きさ (cm)。
 // OpenTrack のコードに固定されていて (40mm)、設定では変えられない
 pub const ARUCO_MARKER_SIZE_CM: f32 = 4.0;
+
+// ターミナルに出すログの初期値 (Bevy の初期値と同じ。wgpu と naga は細かいので警告以上だけ)
+pub const DEFAULT_LOG_FILTER: &str = "info,wgpu=error,naga=warn";
 
 // このPCと設置場所の機材の値 (機材プロファイル)。実行ファイルと同じ場所の config.ini に保存する。
 // ディスプレイの大きさ、見る人の距離、OpenTrack の較正をまとめて持ち、シーンには入れない。
@@ -30,6 +34,10 @@ pub struct AppConfig {
     pub camera_fov_deg: f32,
     // 印刷した AR マーカーの大きさ (黒い四角の一辺, cm)
     pub marker_size_cm: f32,
+    // 頭の動きをなめらかにするか (tracking/smoothing.rs)
+    pub smooth_tracking: bool,
+    // ターミナルに出すログ (RUST_LOG と同じ書き方)。起動するときに読むので、変えたら起動し直す
+    pub log_filter: String,
 }
 
 impl Default for AppConfig {
@@ -43,6 +51,8 @@ impl Default for AppConfig {
             minimize_opentrack: true,
             camera_fov_deg: 56.0,
             marker_size_cm: ARUCO_MARKER_SIZE_CM,
+            smooth_tracking: true,
+            log_filter: DEFAULT_LOG_FILTER.to_string(),
         }
     }
 }
@@ -87,17 +97,7 @@ impl AppConfig {
 
         let mut config = config;
 
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
-                continue;
-            }
-            let Some((key, value)) = line.split_once('=') else {
-                continue;
-            };
-            let key = key.trim();
-            let value = value.trim();
-
+        for (key, value) in entries(&text) {
             match key {
                 "screen_diagonal_inches" => {
                     config.screen_diagonal_inches =
@@ -128,16 +128,61 @@ impl AppConfig {
                     config.marker_size_cm =
                         parse_or_warn(CONFIG_FILE_NAME, key, value, config.marker_size_cm)
                 }
-                _ => warn!("{}: 不明な設定項目を無視しました: {}", CONFIG_FILE_NAME, key),
+                "smooth_tracking" => {
+                    config.smooth_tracking =
+                        parse_or_warn(CONFIG_FILE_NAME, key, value, config.smooth_tracking)
+                }
+                "log_filter" => match EnvFilter::try_new(value) {
+                    Ok(_) => config.log_filter = value.to_string(),
+                    Err(_) => warn!(
+                        "{}: {} の値 '{}' を読めませんでした。デフォルト値 {} を使います",
+                        CONFIG_FILE_NAME, key, value, DEFAULT_LOG_FILTER
+                    ),
+                },
+                // 知らない項目 (前の版で使っていたものなど) は無視する
+                _ => {}
             }
+        }
+
+        // 足りない項目はデフォルト値を使い、エラーで知らせる (項目は save で書くものすべて)
+        let template = Self::default().to_text();
+        let missing: Vec<String> = entries(&template)
+            .filter(|(key, _)| !entries(&text).any(|(k, _)| k == *key))
+            .map(|(key, value)| format!("{}={}", key, value))
+            .collect();
+        if !missing.is_empty() {
+            error!(
+                "{} に次の項目がありません。デフォルト値を使います: {}",
+                CONFIG_FILE_NAME,
+                missing.join(", ")
+            );
         }
 
         config
     }
 
+    // ログの準備より前に、config.ini から log_filter だけを読む (読めなければ初期値。警告は load で出す)
+    pub fn read_log_filter() -> String {
+        std::fs::read_to_string(CONFIG_FILE_NAME)
+            .ok()
+            .and_then(|text| {
+                entries(&text)
+                    .filter(|(key, value)| *key == "log_filter" && EnvFilter::try_new(value).is_ok())
+                    .last()
+                    .map(|(_, value)| value.to_string())
+            })
+            .unwrap_or_else(|| DEFAULT_LOG_FILTER.to_string())
+    }
+
     // 現在の値で config.ini を書き直す (コメントはテンプレートのものになる)
     pub fn save(&self) -> std::io::Result<()> {
-        let text = format!(
+        let text = self.to_text();
+        std::fs::File::create(CONFIG_FILE_NAME).and_then(|mut f| f.write_all(text.as_bytes()))
+    }
+
+    // config.ini に書く内容
+    fn to_text(&self) -> String {
+        format!(
             "# peek_display 機材プロファイル (このPCと設置場所の値。シーンには入りません)\n\
              # 画面(映る部分)の大きさ。比率はモニターの画素数から自動で求めます\n\
              # 対角(インチ)\n\
@@ -159,7 +204,14 @@ impl AppConfig {
              # カメラの対角の視野角(度)。OpenTrack が距離の計算に使う\n\
              camera_fov_deg={}\n\
              # 印刷した AR マーカーの大きさ(黒い四角の一辺, cm)。OpenTrack は 4cm として距離を出すので、その比で直す\n\
-             marker_size_cm={}\n",
+             marker_size_cm={}\n\
+             # 頭の動きをなめらかにするか(true/false)。カメラが測る間を予測でつなぎ、細かいブレをならす\n\
+             smooth_tracking={}\n\
+             \n\
+             # ターミナルに出すログ(RUST_LOG と同じ書き方。RUST_LOG より優先)。変えたら起動し直す\n\
+             # 例: warn (警告とエラーだけ) / info,peek_display::tracking=debug (トラッキングだけ細かく)\n\
+             # warn より絞ると(error など)、このアプリの警告も画面に出なくなる\n\
+             log_filter={}\n",
             self.screen_diagonal_inches,
             self.screen_width_mm,
             self.viewer_base_distance,
@@ -168,10 +220,22 @@ impl AppConfig {
             self.minimize_opentrack,
             self.camera_fov_deg,
             self.marker_size_cm,
-        );
-
-        std::fs::File::create(CONFIG_FILE_NAME).and_then(|mut f| f.write_all(text.as_bytes()))
+            self.smooth_tracking,
+            self.log_filter,
+        )
     }
+}
+
+// 設定ファイルの「キー=値」を順に返す (空行とコメントは飛ばす)
+fn entries(text: &str) -> impl Iterator<Item = (&str, &str)> {
+    text.lines().filter_map(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            return None;
+        }
+        let (key, value) = line.split_once('=')?;
+        Some((key.trim(), value.trim()))
+    })
 }
 
 pub fn parse_or_warn<T: FromStr + Display>(file: &str, key: &str, value: &str, fallback: T) -> T {

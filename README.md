@@ -24,11 +24,13 @@ https://github.com/opentrack/opentrack/blob/unstable/contrib/aruco/test3.png を
 | screen_width_mm | 定規で測った、映る部分の幅（mm）。0 より大きければ対角の代わりに使う（測った値のほうが正確） |
 | viewer_base_distance / viewer_min_distance | センター合わせのときの目と画面の距離 / これ以上近づけない距離（メートル） |
 | opentrack_path | OpenTrack の実行ファイルの場所 |
-| minimize_opentrack | OpenTrack をタスクトレイで起動するか |
+| minimize_opentrack | OpenTrack をタスクトレイで起動するか（画面を出さない）。検査モードの「OpenTrack の画面を出す」でも切り替えられる（すぐ保存し、OpenTrack を起動し直す） |
 | camera_fov_deg | カメラの対角の視野角（度、初期値 56） |
 | marker_size_cm | 印刷したマーカーの一辺（cm、初期値 4） |
+| smooth_tracking | 頭の動きをなめらかにするか（初期値 true）。カメラがマーカーを測る間（カメラのフレームレート）を直前の速さで予測してつなぎ、止まっているときの細かいブレをならす。編集モードの「トラッキング → 動きをなめらかにする」でも切り替えられる |
+| log_filter | ターミナルに出すログ（初期値 `info,wgpu=error,naga=warn`）。書き方は RUST_LOG と同じで、RUST_LOG より優先する。`warn` で警告とエラーだけ、`info,peek_display::tracking=debug` でトラッキングだけ細かく出す。起動するときに読むので、変えたら起動し直す。`error` など warn より絞ると、このアプリの警告も画面に出なくなる |
 
-アプリは起動のたびに、OpenTrack のプロファイル（ドキュメント\opentrack-2.3\display.ini）に、アプリの前提の値（aruco トラッカー、UDP 出力、センター合わせ C、開始 F12、動きの範囲）と、上の視野角を書き込み、OpenTrack が使うプロファイルをこの display に切り替えてから起動する（OpenTrack の画面でほかのプロファイルを選んでいても、次の起動で display に戻る）。視野角を編集モードで変えて保存すると、OpenTrack を起動し直す。使うカメラは OpenTrack の画面で選ぶ。
+アプリは起動のたびに、OpenTrack のプロファイル（ドキュメント\opentrack-2.3\display.ini）に、アプリの前提の値（aruco トラッカー、フィルタなし（なめらかにするのはアプリ側）、UDP 出力、センター合わせ C、開始 F12、動きの範囲）と、上の視野角を書き込み、OpenTrack が使うプロファイルをこの display に切り替えてから起動する（OpenTrack の画面でほかのプロファイルを選んでいても、次の起動で display に戻る）。視野角を編集モードで変えて保存すると、OpenTrack を起動し直す。使うカメラは OpenTrack の画面で選ぶ。
 
 ## 使い方
 
@@ -45,6 +47,14 @@ https://github.com/opentrack/opentrack/blob/unstable/contrib/aruco/test3.png を
 - **編集モード**: オブジェクトとスクリーンの配置を行う
 
 シーンビューは、右ドラッグで回転、ホイールでズーム、ホイールを押しながらのドラッグで平行移動できる。編集モードでは、シーンビューの右下にメインカメラの映像（カメラプレビュー）が出る（「表示 → カメラプレビュー」で消せる）。
+
+### 速く動くと止まる・飛ぶとき
+
+速く動くとカメラの映像がぶれて、OpenTrack がマーカーを見失う。見失っている間は映像が止まり、見つけ直すと位置が飛ぶ（アプリは飛んだ位置まで滑らかに動かす）。検査モードの「マーカー: 見失っている」が出たり、「見失った回数」が増えたりしていれば、これが起きている（OpenTrack は見失っている間も最後の位置を送り続けるので、届いているのに位置が変わらないことで見分ける）。次で減らせる。
+
+- 部屋を明るくする（暗いとカメラのシャッターが遅くなり、映像がぶれやすい）
+- マーカーを大きく印刷する（8〜10cm など。測った一辺を「マーカーの大きさ」に入れる）
+- OpenTrack のトラッカーの設定で、解像度を下げてフレームレートを上げる（検査モードの「計測 ○ 回/秒」が上がる。「OpenTrack から ○ 回/秒」は OpenTrack が送る間隔で、カメラとは関係ない）
 
 ## 編集モード
 

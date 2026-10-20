@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::AppConfig;
 use crate::scene::editor::EditState;
+use crate::tracking::smoothing::PoseSmoother;
 
 const OPENTRACK_DEFAULT_INI: &str = include_str!("../../assets/opentrack_default.ini");
 
@@ -84,7 +85,8 @@ fn select_opentrack_profile() {}
 // アプリが前提にする OpenTrack の設定 (どの機材でも同じ値にする)
 // UDP で 127.0.0.1:4242 に送る、センター合わせは C、開始は F12、動きの範囲は ±75cm (x・y は向きを反転)
 const FIXED_PROFILE: &[(&str, &[(&str, &str)])] = &[
-    ("modules", &[("tracker-dll", "aruco"), ("protocol-dll", "udp")]),
+    // OpenTrack のフィルタは使わない (アプリでなめらかにする。OpenTrack の初期値の Accela を重ねると、遅れが増え、見失いも分からなくなる)
+    ("modules", &[("tracker-dll", "aruco"), ("filter-dll", ""), ("protocol-dll", "udp")]),
     ("udp-proto", &[("ip1", "127"), ("ip2", "0"), ("ip3", "0"), ("ip4", "1")]),
     (
         "opentrack-ui",
@@ -272,6 +274,9 @@ pub struct UdpReceiver {
     pub socket: UdpSocket,
 }
 
+// これより長く届かなければ、OpenTrack のトラッキングが止まっているとみなす
+pub const RECEIVING_TIMEOUT: Duration = Duration::from_millis(500);
+
 // 測る間隔 (この間の平均を出す)
 const STATS_WINDOW: Duration = Duration::from_secs(1);
 
@@ -284,29 +289,39 @@ pub struct TrackingStats {
     pub received_per_second: f32,
     // 最後に届いた時刻
     pub last_received: Option<Instant>,
+    // 直近の1秒あたりに位置が新しくなった回数 (カメラでマーカーを測れた回数)
+    pub measured_per_second: f32,
+    // マーカーを見失っているか (OpenTrack から届いているのに、位置が変わらない)
+    pub lost: bool,
+    // マーカーを見失った回数 (起動してから)
+    pub lost_count: u32,
     window_start: Option<Instant>,
     window_frames: u32,
     window_received: u32,
+    window_measured: u32,
 }
 
 impl TrackingStats {
-    // 1フレーム分を数える。received: このフレームに届いた回数
-    fn record_frame(&mut self, received: u32) {
+    // 1フレーム分を数える。received: このフレームに届いた回数、measured: そのうち位置が新しくなったか
+    fn record_frame(&mut self, received: u32, measured: bool) {
         let now = Instant::now();
         if received > 0 {
             self.last_received = Some(now);
         }
         self.window_frames += 1;
         self.window_received += received;
+        self.window_measured += measured as u32;
         let start = *self.window_start.get_or_insert(now);
         let elapsed = now.duration_since(start);
         if elapsed >= STATS_WINDOW {
             let secs = elapsed.as_secs_f32();
             self.fps = self.window_frames as f32 / secs;
             self.received_per_second = self.window_received as f32 / secs;
+            self.measured_per_second = self.window_measured as f32 / secs;
             self.window_start = Some(now);
             self.window_frames = 0;
             self.window_received = 0;
+            self.window_measured = 0;
         }
     }
 }
@@ -377,6 +392,46 @@ impl Drop for OpentrackProcess {
     }
 }
 
+// アプリが強制終了したとき (デバッガの停止など) は Drop が呼ばれず、OpenTrack が残ってしまう。
+// そこで、起動した OpenTrack を「ハンドルが閉じたら中のプロセスを終了させる」ジョブに入れる。
+// ジョブのハンドルはアプリが終わるまで閉じないので、アプリがどう終わっても Windows が OpenTrack を終了させる
+#[cfg(windows)]
+fn close_with_app(child: &Child) {
+    use std::os::windows::io::AsRawHandle;
+    use std::sync::OnceLock;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation, SetInformationJobObject,
+    };
+
+    // ジョブのハンドル (作れなければ 0)。HANDLE はスレッドをまたげないので数値で持つ
+    static JOB: OnceLock<usize> = OnceLock::new();
+    let job = *JOB.get_or_init(|| unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return 0;
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const _,
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        if ok == 0 { 0 } else { job as usize }
+    });
+    let assigned = job != 0
+        && unsafe { AssignProcessToJobObject(job as HANDLE, child.as_raw_handle() as HANDLE) } != 0;
+    if !assigned {
+        warn!("アプリを強制終了したときに、OpenTrack が残ることがあります (タスクマネージャーで終了してください)");
+    }
+}
+
+#[cfg(not(windows))]
+fn close_with_app(_child: &Child) {}
+
 // OpenTrack を起動したときの機材プロファイル (変わったら起動し直す)
 #[derive(Resource)]
 struct OpentrackLaunched(AppConfig);
@@ -424,6 +479,7 @@ fn start_opentrack(commands: &mut Commands, config: &AppConfig) {
     {
         Ok(child) => {
             info!("OpenTrack を起動しました: {}", config.opentrack_path);
+            close_with_app(&child);
             commands.insert_resource(OpentrackProcess(Some(child)));
             let now = Instant::now();
             commands.insert_resource(AutoStart {
@@ -467,9 +523,10 @@ fn receive_udp(
     config: Res<AppConfig>,
     mut pose: ResMut<HeadPose>,
     mut stats: ResMut<TrackingStats>,
+    mut smoother: Local<PoseSmoother>,
 ) {
     let Some(receiver) = receiver else {
-        stats.record_frame(0);
+        stats.record_frame(0, false);
         return;
     };
 
@@ -484,8 +541,10 @@ fn receive_udp(
             received += 1;
         }
     }
-    stats.record_frame(received);
+    let now = Instant::now();
 
+    let mut raw = None;
+    let mut measured = false;
     if let Some(buf) = latest_data {
         // データが届いた = トラッキングが開始された
         if let Some(mut auto_start) = auto_start {
@@ -499,14 +558,26 @@ fn receive_udp(
 
         // 座標系変換の適用。OpenTrack はマーカーを 4cm として距離を出すので、印刷した大きさとの比で直す
         let k = config.marker_scale();
-        *pose = HeadPose {
-            x: -x * k,
-            y: -y * k,
-            z: z * k,
-            /*yaw: roll,
-            pitch: -yaw,
-            roll: -pitch,*/
-        };
+        let position = Vec3::new(-x * k, -y * k, z * k);
+        measured = smoother.push(now, position);
+        raw = Some(position);
+    }
+    stats.record_frame(received, measured);
+
+    // 届いているのに位置が変わらなければ、マーカーを見失っている (届いていなければトラッキングが止まっている)
+    let receiving = stats.last_received.is_some_and(|at| now.duration_since(at) < RECEIVING_TIMEOUT);
+    let lost = receiving && smoother.lost(now);
+    if lost && !stats.lost {
+        stats.lost_count += 1;
+    }
+    stats.lost = lost;
+
+    // なめらかにするときは、届かないフレームでも予測で位置を進める。
+    // 切り替えたときに飛ばないよう、なめらかにしないときも smoother には入れ続ける
+    let smoothed = smoother.update(now);
+    let position = if config.smooth_tracking { smoothed } else { raw };
+    if let Some(p) = position {
+        *pose = HeadPose { x: p.x, y: p.y, z: p.z };
     }
 }
 

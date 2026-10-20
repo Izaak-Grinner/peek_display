@@ -44,6 +44,7 @@ impl Plugin for UiPlugin {
                     setup_fonts.run_if(run_once),
                     home::home_ui.run_if(in_state(AppMode::Home)),
                     inspection_overlay.run_if(in_state(AppMode::Inspection)),
+                    lost_border.run_if(in_state(AppMode::Production)),
                     edit_panel::edit_panel.run_if(in_state(AppMode::Edit)),
                     problems::problems_ui,
                     update_ui_input_state,
@@ -103,6 +104,8 @@ fn inspection_overlay(
     mut contexts: EguiContexts,
     pose: Res<crate::tracking::tracking::HeadPose>,
     stats: Res<crate::tracking::tracking::TrackingStats>,
+    mut config: ResMut<crate::config::AppConfig>,
+    mut edit_state: ResMut<crate::scene::editor::EditState>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
     egui::Area::new(egui::Id::new("inspection_overlay"))
@@ -118,13 +121,27 @@ fn inspection_overlay(
                 ));
                 ui.separator();
                 ui.label(format!("アプリ: {:.0} fps", stats.fps));
-                ui.label(format!("OpenTrack から: {:.0} 回/秒", stats.received_per_second));
+                ui.label(format!("OpenTrack から: {:.0} 回/秒", stats.received_per_second))
+                    .on_hover_text("OpenTrack はカメラとは関係なく一定の間隔で送ってくる。マーカーを測れていない間は同じ位置が届く");
+                ui.label(format!("計測: {:.0} 回/秒", stats.measured_per_second))
+                    .on_hover_text("位置が新しくなった回数 (カメラでマーカーを測れた回数)。カメラのフレームレートより少なければ、ときどき見失っている");
+                if stats.lost {
+                    ui.colored_label(egui::Color32::from_rgb(0xf0, 0xb0, 0x5a), "マーカー: 見失っている");
+                } else {
+                    ui.label("マーカー: 見えている");
+                }
+                ui.label(format!("見失った回数: {} 回", stats.lost_count))
+                    .on_hover_text("OpenTrack から届いているのに、位置が変わらなくなった回数。速く動いて映像がぶれたり、カメラの範囲から出たりすると増える");
+                ui.label(format!(
+                    "動きをなめらかにする: {}",
+                    if config.smooth_tracking { "オン" } else { "オフ" }
+                ));
                 match stats.last_received {
                     Some(at) => {
                         let ms = at.elapsed().as_millis();
                         let text = format!("最後に届いてから: {} ms", ms);
                         // 0.5 秒以上届いていなければ、OpenTrack のトラッキングが止まっている (マーカーを見失っても送り続けるので、それとは別)
-                        if ms >= 500 {
+                        if at.elapsed() >= crate::tracking::tracking::RECEIVING_TIMEOUT {
                             ui.colored_label(egui::Color32::from_rgb(0xf0, 0xb0, 0x5a), text);
                         } else {
                             ui.label(text);
@@ -134,9 +151,38 @@ fn inspection_overlay(
                         ui.colored_label(egui::Color32::from_rgb(0xf0, 0xb0, 0x5a), "OpenTrack からまだ届いていません");
                     }
                 }
+                ui.separator();
+                let mut show_window = !config.minimize_opentrack;
+                if ui
+                    .checkbox(&mut show_window, "OpenTrack の画面を出す")
+                    .on_hover_text("マーカーの認識をカメラ映像で確かめたいときに出す。切り替えると config.ini に保存し、OpenTrack を起動し直す")
+                    .changed()
+                {
+                    edit_state.save_config_change(&mut config, |c| c.minimize_opentrack = !show_window);
+                }
                 ui.label("Esc: ホームへ戻る");
             });
         });
+    Ok(())
+}
+
+// 本番モードでマーカーを見失っている間、画面のふちに薄い赤の線を出す (見ている人に、映像が止まっている理由を知らせる)
+// 一瞬見失っただけでちらつかないよう、少しかけて出し入れする
+fn lost_border(mut contexts: EguiContexts, stats: Res<crate::tracking::tracking::TrackingStats>) -> Result {
+    const WIDTH: f32 = 6.0;
+    const FADE_SECONDS: f32 = 0.2;
+    let ctx = contexts.ctx_mut()?;
+    let id = egui::Id::new("lost_border");
+    let strength = ctx.animate_bool_with_time(id, stats.lost, FADE_SECONDS);
+    if strength > 0.0 {
+        let color = egui::Color32::from_rgba_unmultiplied(0xe0, 0x40, 0x40, (110.0 * strength) as u8);
+        ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, id)).rect_stroke(
+            ctx.content_rect(),
+            0.0,
+            egui::Stroke::new(WIDTH, color),
+            egui::StrokeKind::Inside,
+        );
+    }
     Ok(())
 }
 

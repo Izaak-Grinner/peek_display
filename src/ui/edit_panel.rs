@@ -1404,6 +1404,9 @@ fn screen_properties(
             10.5,
             TEXT_HINT,
         );
+        ui.checkbox(&mut config.smooth_tracking, "動きをなめらかにする").on_hover_text(
+            "カメラがマーカーを測る間を、直前の速さで予測してつなぎ、止まっているときの細かいブレをならします。すぐに切り替わるので、検査モードで比べられます",
+        );
     });
 }
 
