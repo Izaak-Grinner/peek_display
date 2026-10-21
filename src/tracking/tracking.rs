@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::app_mode::AppMode;
 use crate::config::AppConfig;
 use crate::scene::editor::EditState;
 use crate::tracking::smoothing::PoseSmoother;
@@ -87,6 +88,9 @@ fn select_opentrack_profile() {}
 const FIXED_PROFILE: &[(&str, &[(&str, &str)])] = &[
     // OpenTrack のフィルタは使わない (アプリでなめらかにする。OpenTrack の初期値の Accela を重ねると、遅れが増え、見失いも分からなくなる)
     ("modules", &[("tracker-dll", "aruco"), ("filter-dll", ""), ("protocol-dll", "udp")]),
+    // カメラの映像を MJPEG で受け取る。圧縮しないと、1280x720 以上は USB の帯域が足りず、
+    // 内蔵カメラでは 10 回/秒くらいしか出ない (MJPEG に対応していないカメラでは使われない)
+    ("aruco-tracker", &[("use-mjpeg", "true")]),
     ("udp-proto", &[("ip1", "127"), ("ip2", "0"), ("ip3", "0"), ("ip4", "1")]),
     (
         "opentrack-ui",
@@ -138,7 +142,12 @@ fn ensure_opentrack_profile(config: &AppConfig) {
         &[("use-system-tray", in_tray), ("start-in-tray", in_tray)],
     );
     let fov = format!("{}", config.camera_fov_deg.round() as i32);
-    new_text = set_profile_settings(&new_text, "aruco-tracker", &[("field-of-view", fov.as_str())]);
+    let resolution = config.opentrack_resolution_index().to_string();
+    new_text = set_profile_settings(
+        &new_text,
+        "aruco-tracker",
+        &[("field-of-view", fov.as_str()), ("force-resolution", resolution.as_str())],
+    );
 
     if new_text.replace("\r\n", "\n") == text.replace("\r\n", "\n") {
         return;
@@ -361,6 +370,7 @@ impl Plugin for TrackingPlugin {
                 (
                     auto_start_tracking.run_if(resource_exists::<AutoStart>),
                     restart_opentrack_on_change,
+                    show_opentrack_window_in_inspection,
                 ),
             )
             .add_systems(Last, close_opentrack_on_exit);
@@ -465,6 +475,101 @@ fn restart_opentrack_on_change(
     start_opentrack(&mut commands, saved);
 }
 
+// OpenTrack の画面を出す設定 (minimize_opentrack = false) のとき、画面を出すのは検査モードの間だけにする。
+// ほかのモードでは最小化し、検査モードに入ったら元に戻して手前に出す (OpenTrack は起動し直さない)。
+// 切り替えたときと OpenTrack を起動したときだけ動かすので、ほかのモードでも手で開けば開いたままになる
+#[derive(Default)]
+struct OpentrackWindow {
+    // 最後に合わせた OpenTrack のプロセスと、そのとき出したか
+    applied: Option<(u32, bool)>,
+    // ウィンドウを探した時刻 (起動直後はまだ無いので、間をあけて探し直す)
+    last_search: Option<Instant>,
+}
+
+const WINDOW_SEARCH_INTERVAL: Duration = Duration::from_millis(250);
+
+fn show_opentrack_window_in_inspection(
+    mode: Res<State<AppMode>>,
+    launched: Option<Res<OpentrackLaunched>>,
+    process: Option<Res<OpentrackProcess>>,
+    mut window: Local<OpentrackWindow>,
+) {
+    // トレイ起動のときは、OpenTrack の画面は出ていない (開くのは、タスクトレイから手で開いたときだけ)
+    if launched.is_none_or(|l| l.0.minimize_opentrack) {
+        return;
+    }
+    let Some(pid) = process.as_ref().and_then(|p| p.0.as_ref()).map(|c| c.id()) else {
+        return;
+    };
+    let show = *mode.get() == AppMode::Inspection;
+    if window.applied == Some((pid, show)) {
+        return;
+    }
+    let now = Instant::now();
+    if window.last_search.is_some_and(|at| now - at < WINDOW_SEARCH_INTERVAL) {
+        return;
+    }
+    window.last_search = Some(now);
+    if set_opentrack_window_shown(pid, show) {
+        window.applied = Some((pid, show));
+    }
+}
+
+// OpenTrack (プロセス pid) のメインウィンドウを、出すなら元の大きさに戻して手前に、出さないなら最小化する。
+// どちらもフォーカスは取らない (このアプリのキー操作をそのまま使えるように)。ウィンドウがまだ無ければ false
+#[cfg(windows)]
+fn set_opentrack_window_shown(pid: u32, show: bool) -> bool {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GW_OWNER, GetWindow, GetWindowTextLengthW, GetWindowThreadProcessId, HWND_TOP,
+        IsWindowVisible, SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SetWindowPos, ShowWindow,
+    };
+
+    struct Search {
+        pid: u32,
+        found: HWND,
+    }
+
+    // メインウィンドウ = そのプロセスの、持ち主の無い、表示中で題名のあるウィンドウ
+    // (Qt が作る隠れた補助ウィンドウは表示されていないので外れる。最小化中も「表示中」に入る)
+    unsafe extern "system" fn find(hwnd: HWND, lparam: LPARAM) -> i32 {
+        let search = unsafe { &mut *(lparam as *mut Search) };
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        let is_main = pid == search.pid
+            && unsafe { GetWindow(hwnd, GW_OWNER) }.is_null()
+            && unsafe { IsWindowVisible(hwnd) } != 0
+            && unsafe { GetWindowTextLengthW(hwnd) } > 0;
+        if is_main {
+            search.found = hwnd;
+            return 0;
+        }
+        1
+    }
+
+    let mut search = Search { pid, found: std::ptr::null_mut() };
+    unsafe { EnumWindows(Some(find), &mut search as *mut Search as LPARAM) };
+    let hwnd = search.found;
+    if hwnd.is_null() {
+        return false;
+    }
+    unsafe {
+        if show {
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        } else {
+            ShowWindow(hwnd, SW_SHOWMINNOACTIVE);
+        }
+    }
+    true
+}
+
+#[cfg(not(windows))]
+fn set_opentrack_window_shown(_pid: u32, _show: bool) -> bool {
+    true
+}
+
 fn start_opentrack(commands: &mut Commands, config: &AppConfig) {
     commands.insert_resource(OpentrackLaunched(config.clone()));
     ensure_opentrack_profile(config);
@@ -556,11 +661,15 @@ fn receive_udp(
             f64::from_le_bytes(bytes) as f32
         });
 
-        // 座標系変換の適用。OpenTrack はマーカーを 4cm として距離を出すので、印刷した大きさとの比で直す
-        let k = config.marker_scale();
-        let position = Vec3::new(-x * k, -y * k, z * k);
-        measured = smoother.push(now, position);
-        raw = Some(position);
+        // ちょうど (0, 0, 0) は計測ではない (OpenTrack を起動した直後、マーカーをまだ見つけていない間に届く)。
+        // 使うと映像が正面へ飛ぶので飛ばし、見失っているのと同じに扱う
+        if (x, y, z) != (0.0, 0.0, 0.0) {
+            // 座標系変換の適用。OpenTrack はマーカーを 4cm として距離を出すので、印刷した大きさとの比で直す
+            let k = config.marker_scale();
+            let position = Vec3::new(-x * k, -y * k, z * k);
+            measured = smoother.push(now, position);
+            raw = Some(position);
+        }
     }
     stats.record_frame(received, measured);
 

@@ -155,7 +155,7 @@ fn inspection_overlay(
                 let mut show_window = !config.minimize_opentrack;
                 if ui
                     .checkbox(&mut show_window, "OpenTrack の画面を出す")
-                    .on_hover_text("マーカーの認識をカメラ映像で確かめたいときに出す。切り替えると config.ini に保存し、OpenTrack を起動し直す")
+                    .on_hover_text("マーカーの認識をカメラ映像で確かめたいときに出す。出すのは検査モードの間だけで、ほかのモードでは最小化する。切り替えると config.ini に保存し、OpenTrack を起動し直す")
                     .changed()
                 {
                     edit_state.save_config_change(&mut config, |c| c.minimize_opentrack = !show_window);

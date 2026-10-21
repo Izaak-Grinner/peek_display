@@ -5,7 +5,8 @@
 // 1€フィルタ (One Euro Filter) で細かいブレをならす。1€フィルタは、止まっているときは強くならし、
 // 速く動くときはほとんどならさないので、ブレが消えても遅れはほとんど増えない。
 // 速く動くとカメラの映像がぶれてマーカーを見失い、OpenTrack は最後の位置を送り続ける (位置が変わらなくなる)。
-// 見つけ直すと位置が飛ぶので、飛んだときは予測に使わず (行き過ぎないように)、新しい位置まで少しかけて滑らかに動かす
+// 見つけ直すと位置が飛ぶので、飛んだときは予測に使わず (行き過ぎないように)、新しい位置まで少しかけて滑らかに動かす。
+// 長く見失ったまま (見ている人が離れたなど) なら、正面へゆっくり戻す
 use bevy::prelude::*;
 use std::f32::consts::TAU;
 use std::time::{Duration, Instant};
@@ -21,6 +22,12 @@ const LOST_GAP: Duration = Duration::from_millis(150);
 const JUMP_SPEED: f32 = 300.0;
 // 飛んだときに、新しい位置まで動かす時間
 const GLIDE_TIME: Duration = Duration::from_millis(300);
+
+// 見失ってから、最後の位置のまま待つ時間 (速く動いたときのぶれで一瞬見失うのは、ほとんどこれより短い)
+const HOLD_TIME: Duration = Duration::from_secs(1);
+// 待っても見つからなければ、この時間をかけて正面 (センター合わせの位置, 0) へゆっくり戻す
+// (見ている人が離れたとき、映像を斜めのまま止めておかない)
+const RETURN_TIME: Duration = Duration::from_millis(1500);
 
 // 1€フィルタの調整値 (位置は cm)。
 // MIN_CUTOFF: 止まっているときのならし具合 (Hz。小さいほど強くならす)
@@ -82,6 +89,15 @@ impl PoseSmoother {
     // このフレームで使う位置 (まだ何も届いていなければ None)
     pub fn update(&mut self, now: Instant) -> Option<Vec3> {
         let mut target = self.predicted(now)?;
+        if let Some((t1, _)) = self.latest {
+            let waited = now.duration_since(t1).saturating_sub(HOLD_TIME);
+            if !waited.is_zero() {
+                let t = (waited.as_secs_f32() / RETURN_TIME.as_secs_f32()).min(1.0);
+                // ゆっくり動き出し、ゆっくり止まる
+                let eased = t * t * (3.0 - 2.0 * t);
+                target = target.lerp(Vec3::ZERO, eased);
+            }
+        }
         if let Some(glide) = &self.glide {
             let t = now.duration_since(glide.start).as_secs_f32() / GLIDE_TIME.as_secs_f32();
             if t < 1.0 {
@@ -230,6 +246,33 @@ mod tests {
         assert!(!smoother.lost(back));
         let first = smoother.update(back + ms(16)).unwrap();
         assert!(first.x < 5.0, "{}", first.x);
+    }
+
+    // 見失っても少しの間は最後の位置のままで、長く見失ったら正面へゆっくり戻り、見つけ直したら滑らかに戻る
+    #[test]
+    fn returns_to_center_after_long_loss() {
+        let mut smoother = PoseSmoother::default();
+        let t0 = Instant::now();
+        let frame = Duration::from_millis(16);
+        smoother.push(t0, Vec3::new(20.0, 0.0, 0.0));
+        let mut at = t0;
+        let mut x_at = |smoother: &mut PoseSmoother, until: Instant| {
+            let mut x = 0.0;
+            while at < until {
+                at += frame;
+                x = smoother.update(at).unwrap().x;
+            }
+            x
+        };
+        let held = x_at(&mut smoother, t0 + HOLD_TIME);
+        assert!((held - 20.0).abs() < 1e-3, "{}", held);
+        let returned = x_at(&mut smoother, t0 + HOLD_TIME + RETURN_TIME + Duration::from_secs(2));
+        assert!(returned.abs() < 0.1, "{}", returned);
+        // 見つけ直したら、正面から新しい位置まで滑らかに動く (飛ばない)
+        let back = t0 + Duration::from_secs(6);
+        smoother.push(back, Vec3::new(20.0, 0.0, 0.0));
+        let first = smoother.update(back + frame).unwrap().x;
+        assert!(first > 0.0 && first < 15.0, "{}", first);
     }
 
     // 止まっているときの細かいブレは小さくなる

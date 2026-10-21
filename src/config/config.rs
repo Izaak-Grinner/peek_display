@@ -14,6 +14,14 @@ const CONFIG_FILE_NAME: &str = "config.ini";
 // OpenTrack のコードに固定されていて (40mm)、設定では変えられない
 pub const ARUCO_MARKER_SIZE_CM: f32 = 4.0;
 
+// 印刷するマーカーの大きさの初期値 (cm)。4cm より大きいほうが、離れても認識でき、ブレも小さい
+// (離れて座れるので、左右・上下に動ける範囲も広がる)。OpenTrack との違いは marker_scale で直す
+pub const DEFAULT_MARKER_SIZE_CM: f32 = 6.0;
+
+// OpenTrack の aruco トラッカーで選べるカメラの解像度。並びは OpenTrack の番号 (force-resolution) の順。
+// default はカメラにまかせる (OpenTrack は勧めていない)
+pub const CAMERA_RESOLUTIONS: &[&str] = &["640x480", "320x240", "1280x720", "1920x1080", "default"];
+
 // ターミナルに出すログの初期値 (Bevy の初期値と同じ。wgpu と naga は細かいので警告以上だけ)
 pub const DEFAULT_LOG_FILTER: &str = "info,wgpu=error,naga=warn";
 
@@ -32,6 +40,8 @@ pub struct AppConfig {
     pub minimize_opentrack: bool,
     // カメラの対角の視野角 (度)。OpenTrack が距離の計算に使う
     pub camera_fov_deg: f32,
+    // カメラの解像度 (CAMERA_RESOLUTIONS のどれか)。内蔵カメラは 4:3 だと映像の左右が切られることが多い
+    pub camera_resolution: String,
     // 印刷した AR マーカーの大きさ (黒い四角の一辺, cm)
     pub marker_size_cm: f32,
     // 頭の動きをなめらかにするか (tracking/smoothing.rs)
@@ -49,8 +59,10 @@ impl Default for AppConfig {
             viewer_min_distance: 0.05,
             opentrack_path: r"C:\Program Files (x86)\opentrack\opentrack.exe".to_string(),
             minimize_opentrack: true,
-            camera_fov_deg: 56.0,
-            marker_size_cm: ARUCO_MARKER_SIZE_CM,
+            // 内蔵の FHD カメラによくある値。正確には測って直す
+            camera_fov_deg: 78.0,
+            camera_resolution: "1280x720".to_string(),
+            marker_size_cm: DEFAULT_MARKER_SIZE_CM,
             smooth_tracking: true,
             log_filter: DEFAULT_LOG_FILTER.to_string(),
         }
@@ -75,9 +87,15 @@ impl AppConfig {
         self.marker_size_cm / ARUCO_MARKER_SIZE_CM
     }
 
+    // OpenTrack のプロファイルに書く解像度の番号 (force-resolution)
+    pub fn opentrack_resolution_index(&self) -> usize {
+        CAMERA_RESOLUTIONS.iter().position(|r| *r == self.camera_resolution).unwrap_or(0)
+    }
+
     // OpenTrack のプロファイルに書く値が同じか (違えば OpenTrack を起動し直す)
     pub fn same_opentrack_settings(&self, other: &Self) -> bool {
         self.camera_fov_deg.round() == other.camera_fov_deg.round()
+            && self.camera_resolution == other.camera_resolution
             && self.minimize_opentrack == other.minimize_opentrack
     }
 
@@ -124,6 +142,17 @@ impl AppConfig {
                     config.camera_fov_deg =
                         parse_or_warn(CONFIG_FILE_NAME, key, value, config.camera_fov_deg)
                 }
+                "camera_resolution" => match CAMERA_RESOLUTIONS.iter().find(|r| r.eq_ignore_ascii_case(value)) {
+                    Some(r) => config.camera_resolution = r.to_string(),
+                    None => warn!(
+                        "{}: {} の値 '{}' を読めませんでした ({} のどれか)。デフォルト値 {} を使います",
+                        CONFIG_FILE_NAME,
+                        key,
+                        value,
+                        CAMERA_RESOLUTIONS.join(" / "),
+                        config.camera_resolution
+                    ),
+                },
                 "marker_size_cm" => {
                     config.marker_size_cm =
                         parse_or_warn(CONFIG_FILE_NAME, key, value, config.marker_size_cm)
@@ -198,12 +227,17 @@ impl AppConfig {
              # OpenTrackの実行ファイルのパス\n\
              opentrack_path={}\n\
              # OpenTrackをウィンドウを出さずにタスクトレイで起動するか(true/false)\n\
-             # マーカーの認識をカメラ映像で確認したいときは false にする\n\
+             # マーカーの認識をカメラ映像で確認したいときは false にする(出すのは検査モードの間だけ。ほかのモードでは最小化する)\n\
              # (true でも、タスクトレイのアイコンをクリックすれば画面を開ける)\n\
              minimize_opentrack={}\n\
              # カメラの対角の視野角(度)。OpenTrack が距離の計算に使う\n\
              camera_fov_deg={}\n\
-             # 印刷した AR マーカーの大きさ(黒い四角の一辺, cm)。OpenTrack は 4cm として距離を出すので、その比で直す\n\
+             # カメラの解像度。640x480 / 320x240 / 1280x720 / 1920x1080 / default(カメラにまかせる)\n\
+             # 内蔵カメラは 4:3 (640x480) だと映像の左右が切られ、動ける範囲が狭くなることが多い。\n\
+             # 上げると遠くのマーカーも見つけやすいが、1回の計測が遅くなる。変えたら視野角も測り直す\n\
+             camera_resolution={}\n\
+             # 印刷した AR マーカーの大きさ(黒い四角の一辺, cm)。定規で測った実寸を入れる\n\
+             # OpenTrack は 4cm として距離を出すので、その比で直す\n\
              marker_size_cm={}\n\
              # 頭の動きをなめらかにするか(true/false)。カメラが測る間を予測でつなぎ、細かいブレをならす\n\
              smooth_tracking={}\n\
@@ -219,6 +253,7 @@ impl AppConfig {
             self.opentrack_path,
             self.minimize_opentrack,
             self.camera_fov_deg,
+            self.camera_resolution,
             self.marker_size_cm,
             self.smooth_tracking,
             self.log_filter,

@@ -7,7 +7,7 @@ use bevy_egui::{
 use super::widgets::{self, Button, Icon, NumberField, color::*};
 use crate::app_mode::{AppMode, EditViewInsets};
 use crate::camera::camera_preview::CameraPreview;
-use crate::config::{ARUCO_MARKER_SIZE_CM, AppConfig, DisplayInfo};
+use crate::config::{ARUCO_MARKER_SIZE_CM, AppConfig, CAMERA_RESOLUTIONS, DisplayInfo};
 use crate::scene::editor::{EditState, Pending, SaveAsDialog, SaveStatus, Selection};
 use crate::scene::default_room;
 use crate::scene::import::{ImportKind, ImportState};
@@ -1361,7 +1361,10 @@ fn screen_properties(
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing = vec2(GAP, 6.0);
         let mut open = !panel.tracking_closed;
-        let summary = format!("マーカーの大きさ {:.1} cm · 視野角 {:.0}°", config.marker_size_cm, config.camera_fov_deg);
+        let summary = format!(
+            "マーカーの大きさ {:.1} cm · 視野角 {:.0}° · {}",
+            config.marker_size_cm, config.camera_fov_deg, config.camera_resolution
+        );
         widgets::collapsing_header(ui, &mut open, "トラッキング", &summary);
         panel.tracking_closed = !open;
         if !open {
@@ -1376,7 +1379,7 @@ fn screen_properties(
                 .unit("cm")
                 .range(0.5..=50.0)
                 .show(ui, ui.available_width())
-                .on_hover_text("印刷した AR マーカーの黒い四角の一辺。定規で測った値を入れる");
+                .on_hover_text("印刷した AR マーカーの黒い四角の一辺。定規で測った値を入れる (初期値 6 cm)");
         });
         if (config.marker_size_cm - ARUCO_MARKER_SIZE_CM).abs() > 0.05 {
             widgets::wrapped_label(
@@ -1396,11 +1399,26 @@ fn screen_properties(
                 .unit("°")
                 .range(10.0..=170.0)
                 .show(ui, ui.available_width())
-                .on_hover_text("カメラの対角の視野角。OpenTrack が距離の計算に使う (初期値 56°)");
+                .on_hover_text("カメラの対角の視野角。OpenTrack が距離の計算に使う (初期値 78°)。解像度を変えたら測り直す");
+        });
+        ui.horizontal(|ui| {
+            widgets::fixed_label(ui, TRACKING_LABEL, 24.0, "解像度", 12.0, TEXT_LABEL, Align::Min);
+            egui::ComboBox::from_id_salt("camera_resolution")
+                .width(ui.available_width())
+                .selected_text(config.camera_resolution.as_str())
+                .show_ui(ui, |ui| {
+                    for &resolution in CAMERA_RESOLUTIONS {
+                        ui.selectable_value(&mut config.camera_resolution, resolution.to_string(), resolution);
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "カメラの解像度 (初期値 1280x720)。内蔵カメラは 640x480 だと映像の左右が切られ、動ける範囲が狭くなることが多い。上げると遠くのマーカーも見つけやすいが、1回の計測が遅くなる",
+                );
         });
         widgets::wrapped_label(
             ui,
-            "視野角は、保存すると OpenTrack に書き込み、OpenTrack を起動し直します（数秒トラッキングが止まります）。",
+            "視野角と解像度は、保存すると OpenTrack に書き込み、OpenTrack を起動し直します（数秒トラッキングが止まります）。",
             10.5,
             TEXT_HINT,
         );
