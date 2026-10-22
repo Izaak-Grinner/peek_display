@@ -33,6 +33,8 @@ https://github.com/opentrack/opentrack/blob/unstable/contrib/aruco/test3.png を
 
 アプリは起動のたびに、OpenTrack のプロファイル（ドキュメント\opentrack-2.3\display.ini）に、アプリの前提の値（aruco トラッカー、フィルタなし（なめらかにするのはアプリ側）、UDP 出力、センター合わせ C、開始 F12、動きの範囲）と、上の視野角と解像度を書き込み、OpenTrack が使うプロファイルをこの display に切り替えてから起動する（OpenTrack の画面でほかのプロファイルを選んでいても、次の起動で display に戻る）。OpenTrack の画面で解像度を変えても、次の起動で config.ini の値に戻る。視野角と解像度を編集モードで変えて保存すると、OpenTrack を起動し直す。使うカメラは OpenTrack の画面で選ぶ。
 
+アプリが起動した OpenTrack では、Windows 11 の省電力（ウィンドウが見えないプロセスを遅くする仕組み）を切る。本番モードでは OpenTrack が全画面の後ろに隠れるので、省電力が効くとカメラの計測が間引かれ、頭の動きへの反応がおかしくなるため。Microsoft が用意した方法（SetProcessInformation の ProcessPowerThrottling）で、対象はこのアプリが起動した OpenTrack だけ。OpenTrack が終われば元に戻り、ほかのアプリや Windows の電源設定は変えない。そのぶん、アプリを動かしている間は消費電力と発熱が少し増える（OpenTrack の画面を表示しているときと同じになる）。ノートPCをバッテリーで長く動かすときは、電源につなぐとよい。
+
 ## 使い方
 
 1.このアプリを起動

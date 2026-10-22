@@ -225,6 +225,8 @@ impl AppConfig {
              viewer_min_distance={}\n\
              \n\
              # OpenTrackの実行ファイルのパス\n\
+             # (アプリが起動した OpenTrack は、画面が隠れても遅くならないよう Windows の省電力を切る。\n\
+             #  そのぶん消費電力が少し増えるので、ノートPCは電源につなぐとよい。くわしくは README)\n\
              opentrack_path={}\n\
              # OpenTrackをウィンドウを出さずにタスクトレイで起動するか(true/false)\n\
              # マーカーの認識をカメラ映像で確認したいときは false にする(出すのは検査モードの間だけ。ほかのモードでは最小化する)\n\

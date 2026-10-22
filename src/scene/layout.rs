@@ -187,8 +187,8 @@ impl Default for SceneLayout {
     fn default() -> Self {
         let mut layout = Self::empty();
         layout.add_object(
-            "izayoi",
-            ObjectKind::Model(Model::new("models/izayoi/izayoi_02.glb")),
+            "cat",
+            ObjectKind::Model(Model::new("models/cat/cat.glb")),
             Placement {
                 position: Vec3::new(0.0, FLOOR_Y, -0.4),
                 scale: 0.15,

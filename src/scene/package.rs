@@ -1,6 +1,6 @@
 // シーンファイル (.peek)。中身は zip で、scene.ini と、シーンが使うモデルのファイルを入れる。
 // このファイル1つを渡せば、ほかのPCでも同じシーンが開ける。
-// ファイルはシーンの中の相対パスで入れる (例: models/room/room.glb、models/izayoi/izayoi_02.glb)
+// ファイルはシーンの中の相対パスで入れる (例: models/room/room.glb、models/cat/cat.glb)
 use bevy::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
@@ -321,7 +321,7 @@ mod tests {
         let mut files = PackageFiles::new();
         files.insert("models/room/room.gltf".into(), br#"{"buffers":[{"uri":"room.bin"}]}"#.to_vec());
         files.insert("models/room/room.bin".into(), vec![1, 2, 3]);
-        files.insert("models/izayoi/izayoi_02.glb".into(), vec![4, 5, 6]);
+        files.insert("models/cat/cat.glb".into(), vec![4, 5, 6]);
         files.insert("models/unused/unused.glb".into(), vec![7]);
 
         let dir = std::env::temp_dir().join(format!("peek_display_test_{}", std::process::id()));

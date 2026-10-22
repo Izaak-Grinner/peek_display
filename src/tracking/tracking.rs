@@ -442,6 +442,45 @@ fn close_with_app(child: &Child) {
 #[cfg(not(windows))]
 fn close_with_app(_child: &Child) {}
 
+// Windows 11 は、ウィンドウが最小化・トレイに隠れている・ほかのウィンドウに隠れているプロセスを、
+// 省電力のために遅くする (タイマーの精度を落とし、効率モードで動かす)。OpenTrack がそうなると、
+// カメラの計測が間引かれて頭の動きへの反応がおかしくなる (本番モードでは OpenTrack が全画面の後ろに隠れる)。
+// そこで、起動した OpenTrack にはこの省電力を使わせない
+#[cfg(windows)]
+fn keep_full_speed(child: &Child) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::Threading::{
+        PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling,
+        SetProcessInformation,
+    };
+
+    // ControlMask で選んだものを StateMask で 0 にする = いつも速く動かし、タイマーの精度も落とさない
+    let state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        StateMask: 0,
+    };
+    let ok = unsafe {
+        SetProcessInformation(
+            child.as_raw_handle() as HANDLE,
+            ProcessPowerThrottling,
+            &state as *const _ as *const _,
+            size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        )
+    };
+    if ok == 0 {
+        warn!(
+            "OpenTrack の省電力を切れませんでした。本番モードなどで OpenTrack の画面が隠れていると、反応が遅れることがあります ({})",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn keep_full_speed(_child: &Child) {}
+
 // OpenTrack を起動したときの機材プロファイル (変わったら起動し直す)
 #[derive(Resource)]
 struct OpentrackLaunched(AppConfig);
@@ -585,6 +624,7 @@ fn start_opentrack(commands: &mut Commands, config: &AppConfig) {
         Ok(child) => {
             info!("OpenTrack を起動しました: {}", config.opentrack_path);
             close_with_app(&child);
+            keep_full_speed(&child);
             commands.insert_resource(OpentrackProcess(Some(child)));
             let now = Instant::now();
             commands.insert_resource(AutoStart {
