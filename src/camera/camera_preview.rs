@@ -5,6 +5,7 @@ use bevy::{
 };
 
 use crate::app_mode::AppMode;
+use crate::camera::main_camera::MAIN_TONEMAPPING;
 use crate::camera::off_axis_projection::OffAxisProjection;
 
 // 編集モードのカメラプレビューに出す、メインカメラと同じ見え方のカメラ。
@@ -40,6 +41,7 @@ fn setup_preview_camera(mut commands: Commands, mut images: ResMut<Assets<Image>
     ));
     commands.spawn((
         Camera3d::default(),
+        MAIN_TONEMAPPING,
         Projection::custom(OffAxisProjection::default()),
         Camera {
             // 画面に描くカメラより先に描いておく

@@ -56,6 +56,25 @@ fn main() {
             test_shot(commands, time, done, exit, &path)
         });
     }
+    // Debug: set PEEK_MODE=production|inspection|edit to start in that mode.
+    if let Ok(mode) = std::env::var("PEEK_MODE") {
+        let mode = match mode.as_str() {
+            "production" => app_mode::AppMode::Production,
+            "inspection" => app_mode::AppMode::Inspection,
+            "edit" => app_mode::AppMode::Edit,
+            _ => app_mode::AppMode::Home,
+        };
+        app.add_systems(Startup, move |mut next: ResMut<NextState<app_mode::AppMode>>| next.set(mode));
+    }
+    // Debug: set PEEK_EYE=x,y,z (cm) to fix the head pose (after receive_udp in PreUpdate, before Update).
+    if let Ok(eye) = std::env::var("PEEK_EYE") {
+        let v: Vec<f32> = eye.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        if let [x, y, z] = v[..] {
+            app.add_systems(RunFixedMainLoop, move |mut pose: ResMut<tracking::tracking::HeadPose>| {
+                *pose = tracking::tracking::HeadPose { x, y, z };
+            });
+        }
+    }
     app.run();
 }
 

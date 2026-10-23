@@ -104,6 +104,8 @@ pub fn on_model_ready(
     nodes: Query<(&Transform, Option<&Name>)>,
     mut cameras: Query<&mut Camera>,
     lights: Query<(), LightFilter>,
+    meshes: Query<&Mesh3d>,
+    mut mesh_assets: ResMut<Assets<Mesh>>,
 ) {
     let Ok((placeable, model_name, part)) = placeables.get(ready.entity) else {
         return;
@@ -112,7 +114,35 @@ pub fn on_model_ready(
     // モデル自体の Transform (シーンでの配置) は含めず、ファイルの中の座標で調べる
     let roots = children.get(ready.entity).map(|list| list.to_vec()).unwrap_or_default();
     for root in roots {
-        visit(root, Transform::IDENTITY, true, &children, &nodes, &cameras.as_readonly(), &mut found);
+        visit(root, Transform::IDENTITY, None, &children, &nodes, &cameras.as_readonly(), &meshes, &mut found);
+    }
+
+    // 鏡に映したように反転した配置 (拡大率がマイナス) のメッシュは、面の巻き方向を反転したものに差し替える。
+    // Bevy は両面表示の材質で裏表を巻き方向だけで決めるので、そのままだと見えている面を裏として描き、暗くなる。
+    // ワールドの部品なら、残すノードの中のものだけ
+    let kept = part.and_then(|ModelPart(node)| found.top.iter().find(|(name, ..)| name == node).map(|(_, e, _)| *e));
+    let mut inverted: HashMap<AssetId<Mesh>, Option<Handle<Mesh>>> = HashMap::new();
+    for (top, entity, mesh) in &found.mirrored {
+        if part.is_some() && *top != kept {
+            continue;
+        }
+        let handle = inverted
+            .entry(mesh.id())
+            .or_insert_with(|| {
+                let mesh = mesh_assets.get(mesh)?.clone().with_inverted_winding().ok()?;
+                Some(mesh_assets.add(mesh))
+            })
+            .clone();
+        if let Some(handle) = handle {
+            commands.entity(*entity).insert(Mesh3d(handle));
+        }
+    }
+    if !inverted.is_empty() {
+        info!(
+            "{} の反転したメッシュ {} 個の巻き方向を直しました",
+            model_name.map(|n| n.as_str()).unwrap_or("モデル"),
+            inverted.values().filter(|h| h.is_some()).count()
+        );
     }
 
     // glTF のカメラは使わない (シーンビューやメインカメラと取り合わないように)
@@ -172,16 +202,20 @@ struct Found {
     // 一番上の階層の、部品にしないノード (カメラ)
     other_top: Vec<Entity>,
     cameras: Vec<Entity>,
+    // 反転した配置のメッシュ (含まれる一番上のノード、エンティティ、メッシュ)
+    mirrored: Vec<(Option<Entity>, Entity, Handle<Mesh>)>,
 }
 
-// モデルの子孫をたどる。top: まだ名前の付いたノードに入っていない (一番上の階層を探している)
+// モデルの子孫をたどる。top: 含まれる一番上の名前の付いたノード (None ならまだ一番上の階層を探している)
+#[allow(clippy::too_many_arguments)]
 fn visit(
     entity: Entity,
     parent: Transform,
-    top: bool,
+    top: Option<Entity>,
     children: &Query<&Children>,
     nodes: &Query<(&Transform, Option<&Name>)>,
     cameras: &Query<&Camera>,
+    meshes: &Query<&Mesh3d>,
     found: &mut Found,
 ) {
     let (local, name) = nodes.get(entity).map(|(t, n)| (*t, n)).unwrap_or((Transform::IDENTITY, None));
@@ -198,18 +232,23 @@ fn visit(
         if name.as_str() == SCREEN_NODE && holds_camera {
             found.screen = Some(global);
         }
-        if top {
+        if top.is_none() {
             if holds_camera {
                 found.other_top.push(entity);
             } else {
                 found.top.push((name.to_string(), entity, local));
             }
+            top = Some(entity);
         }
-        top = false;
+    }
+    if let Ok(Mesh3d(mesh)) = meshes.get(entity)
+        && global.compute_affine().matrix3.determinant() < 0.0
+    {
+        found.mirrored.push((top, entity, mesh.clone()));
     }
     if let Some(list) = child_list {
         for child in list {
-            visit(*child, global, top, children, nodes, cameras, found);
+            visit(*child, global, top, children, nodes, cameras, meshes, found);
         }
     }
 }

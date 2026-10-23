@@ -1,6 +1,9 @@
-use bevy::prelude::*;
+use bevy::{core_pipeline::tonemapping::Tonemapping, prelude::*};
 
 use crate::camera::off_axis_projection::OffAxisProjection;
+
+// メインカメラ (とカメラプレビュー) の色調補正。Blender の標準 (AgX) に合わせて、Blender で見た色に近づける
+pub const MAIN_TONEMAPPING: Tonemapping = Tonemapping::AgX;
 
 #[derive(Component)]
 pub struct MainCamera;
@@ -17,6 +20,7 @@ impl Plugin for MainCameraPlugin {
 fn setup_main_camera(mut commands: Commands) {
     commands.spawn((
         Camera3d::default(),
+        MAIN_TONEMAPPING,
         Projection::custom(OffAxisProjection::default()),
         Camera {
             order: 1,
